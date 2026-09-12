@@ -25,6 +25,7 @@ import { resolve } from 'node:path';
 import { flagBool, flagNumber, flagString } from './index.ts';
 import type { Command, CommandContext, CommandResult } from './index.ts';
 import { buildCloudProvider, buildLocalProvider, cloudTierModel } from '../providers/index.ts';
+import { CodebaseIndex } from '../index/index.ts';
 import type { Provider } from '../providers/types.ts';
 import { ProviderError } from '../providers/types.ts';
 import { DemoProvider } from '../providers/demo.ts';
@@ -440,6 +441,20 @@ export const codeCommand: Command = {
 
     const project = await gatherProjectContext(workspace);
 
+    /*
+     * One index per session, built in the background.
+     *
+     * Deliberately not awaited: a cold build on a large repository takes seconds, and
+     * nothing about starting a session should wait for it. The agent's first tool call
+     * needs the index and will await it then; by that point the user has read the banner
+     * and typed a message, so the wait has already been paid. If it fails, the tools fall
+     * back to direct scanning and the session continues.
+     */
+    const repoIndex = new CodebaseIndex(workspace, ctx.dataDir);
+    void repoIndex.refresh().catch(() => {
+      /* the tools degrade on their own; a failed warm-up must not end the session */
+    });
+
     // ---------------------------------------------------------------- render
     const out = (s = ''): void => {
       process.stdout.write(`${s}\n`);
@@ -730,6 +745,7 @@ export const codeCommand: Command = {
           deadlineMs: (flagNumber(ctx.args, 'deadline-min') ?? 10) * 60_000,
           temperature: flagNumber(ctx.args, 'temperature') ?? 0.2,
           project,
+          index: repoIndex,
           signal: abortController.signal,
         });
 

@@ -419,7 +419,8 @@ src/
   eval/           task corpus, routing metrics, counterfactual replay
   util/           logging, argv, text, hashing, atomic fs, process helpers
 test/             345 tests, no network, no hardware required
-docs/             interactive.md · routing.md · rl-design.md · local-models.md · privacy.md
+docs/             interactive.md · codebase-index.md · routing.md · rl-design.md · local-models.md · privacy.md
+bench/            the agentic benchmark suite (see bench/README.md)
 scripts/          bootstrap-local.sh (dry-run default) · nightly-tick.sh
 ```
 

@@ -1,0 +1,4 @@
+# The benchmark suite ships deliberately broken fixtures — one-file programs with
+# deliberate bugs, plus their hidden tests. They are real source to git and pure noise to
+# a symbol search over the harness itself.
+bench/suite/

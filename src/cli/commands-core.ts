@@ -5,7 +5,7 @@
 import { cpus, totalmem } from 'node:os';
 import { join } from 'node:path';
 
-import { flagBool, flagList, flagString } from './index.ts';
+import { flagBool, flagList, flagNumber, flagString } from './index.ts';
 import type { Command, CommandContext, CommandResult } from './index.ts';
 import { buildProviders, buildLocalProvider, rankLocalModels, LOCAL_RUNTIME_DEFAULTS } from '../providers/index.ts';
 import { MockProvider } from '../providers/mock.ts';
@@ -21,6 +21,7 @@ import { PROVIDER_PROFILES, providerProfile } from '../config/schema.ts';
 import { cloudBaseUrl, priceFor, resolveApiKeyFor, saveConfig, writeSecret } from '../config/load.ts';
 import { formatBytes, formatDuration, readTextOrNull, resolvePath, fileExists } from '../util/fsx.ts';
 import { exec, hasBinary } from '../util/proc.ts';
+import { CodebaseIndex, focusFromTask } from '../index/index.ts';
 import { HARNESS_VERSION } from '../version.ts';
 import { style } from '../util/log.ts';
 
@@ -842,4 +843,96 @@ function coerce(raw: string): string | number | boolean | null | string[] {
   return raw;
 }
 
-export const coreCommands: Command[] = [doctor, setup, route, run, models, config];
+
+/* ------------------------------------------------------------------ */
+/* index                                                              */
+/* ------------------------------------------------------------------ */
+
+const indexCommand: Command = {
+  name: 'index',
+  summary: 'build and inspect the codebase index: symbols, references and the ranked repo map',
+  usage: 'proto index [--force] [--stats] [--map "focus"] [--symbol NAME] [--refs NAME] [--outline PATH]',
+  flags: [
+    { name: 'force', type: 'boolean', description: 'ignore the cache and re-extract every file' },
+    { name: 'stats', type: 'boolean', description: 'print index statistics only' },
+    { name: 'map', type: 'string', description: 'render the ranked repository map, using this text as the focus' },
+    { name: 'symbol', type: 'string', description: 'find where a symbol is defined' },
+    { name: 'refs', type: 'string', description: 'find where a symbol is referenced' },
+    { name: 'outline', type: 'string', description: 'list the definitions in one file' },
+    { name: 'budget', type: 'number', description: 'token budget for --map (default 2000)' },
+    { name: 'workspace', type: 'string', description: 'project root (default: current directory)' },
+  ],
+  async run(ctx): Promise<CommandResult> {
+    const workspace = resolvePath(flagString(ctx.args, 'workspace') ?? process.cwd(), process.cwd());
+    const index = new CodebaseIndex(workspace, ctx.dataDir);
+
+    const warm = await index.refresh(flagBool(ctx.args, 'force'));
+    const stats = index.stats;
+    const human: string[] = [];
+    const json: Record<string, unknown> = { workspace, stats };
+
+    // The build is worth reporting even when another subcommand was asked for: a slow
+    // first call and a stale cache look identical from the outside otherwise.
+    if (!flagBool(ctx.args, 'stats')) {
+      human.push(style.bold(`proto index — ${workspace}`));
+      human.push('');
+      human.push(
+        `  ${stats.files} file(s) indexed, ${stats.symbols} definition(s)` +
+          `  (${stats.changed} re-extracted, ${stats.removed} removed, ${stats.buildMs}ms)`,
+      );
+      human.push(`  cache  ${formatBytes(stats.cacheBytes)}  ${stats.changed === 0 && warm.files > 0 ? '(warm)' : ''}`);
+      for (const w of index.warnings) human.push(`  ${style.dim('note')}  ${w}`);
+      human.push('');
+    }
+
+    const symbol = flagString(ctx.args, 'symbol');
+    const refs = flagString(ctx.args, 'refs');
+    const outline = flagString(ctx.args, 'outline');
+    const focus = flagString(ctx.args, 'map');
+
+    if (flagBool(ctx.args, 'stats')) {
+      human.push(`${stats.files} files, ${stats.symbols} symbols, ${stats.changed} changed, ${stats.removed} removed, ${stats.buildMs}ms, cache ${formatBytes(stats.cacheBytes)}`);
+      return { human, json: { workspace, stats, warnings: index.warnings }, exitCode: 0 };
+    }
+
+    if (focus !== undefined) {
+      const budget = flagNumber(ctx.args, 'budget') ?? 2000;
+      const f = focusFromTask(focus, index.graph);
+      const map = index.repoMap({ budgetChars: budget * 4, focus: f.paths, focusSymbols: f.symbols });
+      human.push(map.text);
+      human.push('');
+      human.push(style.dim(`  ${map.files.length}/${map.totalFiles} file(s) shown; focus ${[...f.paths, ...f.symbols].join(', ') || '(none)'}`));
+      json['map'] = { text: map.text, files: map.files.map((x) => x.path), total: map.totalFiles, focus: f };
+      return { human, json, exitCode: 0 };
+    }
+
+    if (symbol !== undefined) {
+      const { hits, exact } = index.findSymbol(symbol, 40);
+      human.push(exact ? `definitions of ${symbol}:` : `no exact match for ${symbol}; names containing it:`);
+      for (const h of hits) human.push(`  ${h.path}:${h.line}  ${h.kind}${h.signature ? `  ${h.signature}` : ''}`);
+      if (hits.length === 0) human.push('  (none)');
+      json['symbol'] = { name: symbol, exact, hits };
+      return { human, json, exitCode: 0 };
+    }
+
+    if (refs !== undefined) {
+      const hits = index.findReferences(refs, 200);
+      human.push(`references to ${refs} in ${new Set(hits.map((h) => h.path)).size} file(s):`);
+      for (const h of hits) human.push(`  ${h.path}:${h.line}: ${h.text ?? ''}`);
+      if (hits.length === 0) human.push('  (none)');
+      json['references'] = { name: refs, hits };
+      return { human, json, exitCode: 0 };
+    }
+
+    if (outline !== undefined) {
+      const text = index.outline(outline);
+      human.push(text ?? `not in the index: ${outline}`);
+      json['outline'] = { path: outline, text };
+      return { human, json, exitCode: text === null ? 1 : 0 };
+    }
+
+    return { human, json, exitCode: 0 };
+  },
+};
+
+export const coreCommands: Command[] = [doctor, setup, route, run, models, config, indexCommand];

@@ -28,6 +28,7 @@
 import type { ChatRequest, ChatResponse, Message, Provider, ToolCall } from '../providers/types.ts';
 import { ProviderError } from '../providers/types.ts';
 import type { Tool, ToolContext, ToolRegistry, ToolResult } from '../tools/types.ts';
+import type { CodebaseIndex } from '../index/index.ts';
 import { buildSystemPrompt, gatherProjectContext, looksLikeVerification, turnReminder } from './prompt.ts';
 import type { ProjectContext, TurnState } from './prompt.ts';
 import { HARNESS_VERSION } from '../version.ts';
@@ -86,6 +87,12 @@ export interface AgentOptions {
   signal?: AbortSignal;
   interactive?: boolean;
   maxToolOutputChars?: number;
+  /**
+   * Codebase index for this workspace. When present, the repository tools can answer
+   * `repo_map` / `find_symbol` / `find_references`, and `search` narrows through it.
+   * Optional: the loop works without one, just more expensively.
+   */
+  index?: CodebaseIndex;
   /** Reuse a previously gathered context (cheaper, and stable within a session). */
   project?: ProjectContext;
   /** Skip the verification reminder (used by tests). */
@@ -104,7 +111,14 @@ export async function runAgentTurn(opts: AgentOptions): Promise<AgentResult> {
   const maxToolOutputChars = opts.maxToolOutputChars ?? 24_000;
 
   const project = opts.project ?? (await gatherProjectContext(opts.workspace));
-  const systemPrompt = buildSystemPrompt(project, { tools: opts.tools.list().map((t) => t.name) });
+  // Repo size is passed in so the prompt can tell the model to work differently on a
+  // repository too large to read. Only a populated index can answer that, so an index
+  // that has not finished building simply omits the hint rather than guessing.
+  const repoStats = opts.index?.ready === true ? opts.index.stats : undefined;
+  const systemPrompt = buildSystemPrompt(project, {
+    tools: opts.tools.list().map((t) => t.name),
+    ...(repoStats === undefined ? {} : { repo: { files: repoStats.files, symbols: repoStats.symbols } }),
+  });
   onEvent({ type: 'context', project, systemPrompt });
 
   const messages: Message[] = [
@@ -227,6 +241,7 @@ export async function runAgentTurn(opts: AgentOptions): Promise<AgentResult> {
         workspace: opts.workspace,
         interactive,
         maxOutputChars: maxToolOutputChars,
+        ...(opts.index === undefined ? {} : { index: opts.index }),
         approve: async (req) => {
           const decision = await opts.approve(req);
           onEvent({ type: 'approval', title: req.title, decision });

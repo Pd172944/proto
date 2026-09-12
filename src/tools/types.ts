@@ -18,6 +18,8 @@
 
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 
+import type { CodebaseIndex } from '../index/index.ts';
+
 export type Risk = 'read' | 'write' | 'exec';
 
 export interface ApprovalRequest {
@@ -43,6 +45,15 @@ export interface ToolContext {
   interactive: boolean;
   /** Hard cap on characters any single tool may return. */
   maxOutputChars: number;
+  /**
+   * The codebase index, when the session has one.
+   *
+   * Optional on purpose. A tool must never *require* the index to answer, because the
+   * index is an accelerator and a wrong or missing index would otherwise turn into a
+   * wrong answer rather than a slow one. Tools that can use it fall back to a direct
+   * scan when it is absent.
+   */
+  index?: CodebaseIndex;
 }
 
 export interface ToolResult {

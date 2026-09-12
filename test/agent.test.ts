@@ -222,10 +222,20 @@ describe('tools: safety and correctness', () => {
   it('registers every tool exactly once and groups them by risk', () => {
     const registry = buildToolRegistry();
     const byRisk = registry.byRisk();
-    assert.deepEqual(byRisk.read.sort(), ['list_files', 'read_file', 'search']);
+    // The repository-intelligence tools are all reads: they answer questions about the
+    // codebase without touching it, so they must stay available in read-only mode.
+    assert.deepEqual(byRisk.read.sort(), [
+      'file_outline',
+      'find_references',
+      'find_symbol',
+      'list_files',
+      'read_file',
+      'repo_map',
+      'search',
+    ]);
     assert.deepEqual(byRisk.write.sort(), ['edit_file', 'write_file']);
     assert.deepEqual(byRisk.exec, ['run_command']);
-    assert.equal(registry.specs().length, 6);
+    assert.equal(registry.specs().length, 10);
     assert.throws(() => registry.register(readFileTool), /duplicate tool/);
   });
 

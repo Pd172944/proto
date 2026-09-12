@@ -21,6 +21,9 @@ import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { mkdirSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 
+import { discoverFiles } from '../index/walk.ts';
+import { scanFiles } from '../index/search.ts';
+import { repoIndexTools } from './repo.ts';
 import { capOutput, resolveInsideWorkspace, ToolRegistry } from './types.ts';
 import type { Tool, ToolContext, ToolResult } from './types.ts';
 import { languageOfPath } from '../router/features.ts';
@@ -214,61 +217,48 @@ export const searchTool: Tool = {
 
     const globFilter = argString(args, 'glob');
     const max = Math.min(500, Math.max(1, argNumber(args, 'max_results') ?? 80));
-    const skip = new Set(['.git', 'node_modules', '.venv', 'venv', '__pycache__', 'dist', 'build', '.next', 'target', 'var']);
-    const hits: string[] = [];
-    let scanned = 0;
+    const base = dir === '.' ? undefined : dir.replace(/^\.\//, '');
 
-    const walk = (d: string): void => {
-      if (hits.length >= max || scanned > 4000) return;
-      let entries: string[];
-      try {
-        entries = readdirSync(d);
-      } catch {
-        return;
-      }
-      for (const name of entries) {
-        if (hits.length >= max) return;
-        if (skip.has(name)) continue;
-        const abs = join(d, name);
-        let st;
-        try {
-          st = statSync(abs);
-        } catch {
-          continue;
-        }
-        if (st.isDirectory()) {
-          walk(abs);
-          continue;
-        }
-        if (st.size > 1_000_000) continue;
-        const rel = relative(resolved.abs, abs);
-        if (globFilter && !rel.includes(globFilter)) continue;
-        scanned++;
-        let text: string;
-        try {
-          text = readFileSync(abs, 'utf8');
-        } catch {
-          continue;
-        }
-        if (text.includes('\u0000')) continue; // binary
-        const fileLines = text.split('\n');
-        for (let i = 0; i < fileLines.length && hits.length < max; i++) {
-          const line = fileLines[i] as string;
-          if (re.test(line)) {
-            hits.push(`${join(dir, rel)}:${i + 1}: ${line.trim().slice(0, 240)}`);
-          }
-        }
-      }
-    };
-    walk(resolved.abs);
+    /*
+     * Two engines, one contract: return the matches, or say why none were found.
+     *
+     * With an index, `git grep` does the work in C over git's own file list and the index
+     * narrows the rest — a repository-wide search becomes a scan of the handful of files
+     * that could match. Without one, discovery still applies every gitignore rule before
+     * a byte is read, which is what keeps the fallback bounded.
+     *
+     * The old version read every file in the tree into memory on every call with a
+     * hardcoded skip list. It is gone: on a real repository it was the single most
+     * expensive thing the agent did, and it silently stopped at 4000 files.
+     */
+    let outcome;
+    if (ctx.index !== undefined) {
+      await ctx.index.ensure();
+      outcome = ctx.index.search({ pattern, caseSensitive: false, maxResults: max, ...(globFilter ? { glob: globFilter } : {}) });
+    } else {
+      const discovery = await discoverFiles(ctx.workspace);
+      const candidates = discovery.files.map((f) => f.path).filter((p) => (base === undefined ? true : p.startsWith(base)));
+      outcome = scanFiles(ctx.workspace, candidates, { pattern, caseSensitive: false, maxResults: max, ...(globFilter ? { glob: globFilter } : {}) });
+    }
 
-    const body = hits.length > 0 ? hits.join('\n') : `no matches for /${pattern}/ in ${dir}`;
+    const hits = outcome.hits.filter((h) => (base === undefined ? true : h.path.startsWith(base)));
+    const body =
+      hits.length > 0
+        ? hits.map((h) => `${h.path}:${h.line}: ${h.text}`).join('\n')
+        : `no matches for /${pattern}/ in ${dir}` +
+          (outcome.truncated ? ' (the search was cut short — narrow it with glob or path)' : '');
     const capped = capOutput(body, ctx.maxOutputChars);
     return {
       ok: true,
       title: `search /${pattern}/ → ${hits.length} match${hits.length === 1 ? '' : 'es'}`,
       output: capped.text,
-      meta: { truncated: capped.truncated, durationMs: Date.now() - started, matches: hits.length, scanned },
+      meta: {
+        truncated: capped.truncated || outcome.truncated,
+        durationMs: Date.now() - started,
+        matches: hits.length,
+        engine: outcome.engine,
+        filesScanned: outcome.filesScanned,
+      },
     };
   },
 };
@@ -550,11 +540,20 @@ function describeChange(before: string, after: string): string {
 /* registry                                                            */
 /* ------------------------------------------------------------------ */
 
+/**
+ * The full agent tool set.
+ *
+ * Ordering is the reading order the prompt recommends, not a priority: the repository
+ * tools come first because on a large codebase they should be reached for before
+ * `read_file`, and a model that scans the list top-down should meet them in that order.
+ */
 export function buildToolRegistry(): ToolRegistry {
-  return new ToolRegistry()
+  const registry = new ToolRegistry();
+  for (const tool of repoIndexTools) registry.register(tool);
+  return registry
+    .register(searchTool)
     .register(readFileTool)
     .register(listFilesTool)
-    .register(searchTool)
     .register(writeFileTool)
     .register(editFileTool)
     .register(runCommandTool);

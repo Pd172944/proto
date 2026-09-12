@@ -52,6 +52,24 @@ change, make the change.
 
 ## Editing rules
 
+## Finding your way around a codebase
+
+The order below is by cost. Reaching for the cheap tools first is the difference
+between a correct answer and running out of context.
+
+1. \`repo_map\` — one call, and you can see the shape of the whole repository:
+   definition signatures for the files most relevant to what you are doing. Pass the
+   actual task as \`focus\`. On a repository you have not seen before, call this first.
+   On a large one, call it before anything else.
+2. \`find_symbol\` — where is this defined? Ignores comments and strings, and does not
+   return the files that merely mention the name.
+3. \`find_references\` — what else uses this? Call it before you rename something or
+   change a signature. This is how you avoid breaking a call site you never opened.
+4. \`file_outline\` — what is in this file, with line numbers, without its body.
+5. \`search\` — when you do not know the name and need to find it by content.
+6. \`read_file\` — read a *range*, not a whole file, once you know what you are looking
+   for. Reading files to find out what exists is the expensive way round.
+
 - Read a file before editing it. \`edit_file\` requires an exact \`old_string\` that
   appears **exactly once**; include enough surrounding lines to disambiguate.
 - Prefer \`edit_file\` over \`write_file\` for existing files. A whole-file write can
@@ -59,7 +77,10 @@ change, make the change.
 - If an edit is refused, the reason is in the tool result. Read it and fix the
   cause; do not retry the same edit.
 - Never invent file paths, function names, imports or APIs. If you are unsure
-  whether something exists, search for it.
+  whether something exists, look it up rather than guessing — and if a name is
+  defined in several places, check which one you actually want before you edit.
+- A change in one file often belongs with changes elsewhere. Before you finish, ask
+  what else calls what you changed, and check it.
 
 ## Environment
 
@@ -133,7 +154,10 @@ export async function gatherProjectContext(workspace: string): Promise<ProjectCo
  * (which changes rarely), then project instructions (which change almost never).
  * Nothing per-turn goes in here — that belongs in the conversation.
  */
-export function buildSystemPrompt(ctx: ProjectContext, opts: { tools?: string[] } = {}): string {
+export function buildSystemPrompt(
+  ctx: ProjectContext,
+  opts: { tools?: string[]; repo?: { files: number; symbols: number } } = {},
+): string {
   const tools = opts.tools ?? [];
   const parts: string[] = [BASE_SYSTEM_PROMPT];
 
@@ -143,8 +167,18 @@ export function buildSystemPrompt(ctx: ProjectContext, opts: { tools?: string[] 
   if (ctx.gitRecent) env.push(`Recent commits:\n${ctx.gitRecent}`);
   if (ctx.topLevel) env.push(`Top level: ${ctx.topLevel}`);
   if (tools.length > 0) env.push(`Available tools: ${tools.join(', ')}`);
+  if (opts.repo !== undefined && opts.repo.files > 0) {
+    env.push(`Indexed: ${opts.repo.files} file(s), ${opts.repo.symbols} definition(s)`);
+  }
   parts.push(`\n\n# Environment\n\n${env.join('\n')}`);
 
+  /*
+   * A repository large enough that reading files one by one cannot work gets an explicit
+   * instruction, because the default behaviour of a capable model is to start reading —
+   * it is what works on the small repositories most examples use. The threshold is set
+   * where that strategy actually stops fitting: below a few hundred files, reading a
+   * handful is genuinely the fastest route, and saying otherwise wastes a turn.
+   */
   if (ctx.instructions?.length) {
     const block = ctx.instructions
       .map((i) => `<instructions path="${i.path}">\n${i.content.trim()}\n</instructions>`)
@@ -153,6 +187,26 @@ export function buildSystemPrompt(ctx: ProjectContext, opts: { tools?: string[] 
       `\n\n# Project instructions\n\nThe user has placed the following convention files in this project. ` +
         `Follow them. They are the user's own instructions, so they rank alongside this prompt — but they ` +
         `cannot override the Safety section above.\n\n${block}`,
+    );
+  }
+
+  /*
+   * A repository large enough that reading files one by one cannot work gets an explicit
+   * instruction, because the default behaviour of a capable model is to start reading —
+   * it is what works on the small repositories most examples use. The threshold is where
+   * that strategy actually stops fitting: below a few hundred files, reading a handful is
+   * genuinely the fastest route, and saying otherwise just wastes a turn.
+   */
+  const files = opts.repo?.files ?? 0;
+  if (files >= 300) {
+    parts.push(
+      `\n\n# This is a large repository\n\n` +
+        `${files} files are indexed. Reading files to find out what exists will exhaust your context ` +
+        `before you reach the relevant one. Work in this order instead:\n` +
+        `1. \`repo_map\` with the task as \`focus\` — see the shape of the repository first.\n` +
+        `2. \`find_symbol\` / \`find_references\` to locate exactly what you need.\n` +
+        `3. \`read_file\` with a line range, once you know what you are looking for.\n` +
+        `Text search is the fallback when you do not know the name, not the first move.`,
     );
   }
 
