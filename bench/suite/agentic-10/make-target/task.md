@@ -1,0 +1,1 @@
+The `Makefile` can build, but there is no way to run the Python test suite through it. Add a `test` target that runs the tests in `test_calc.py`, and make that target the default one, so running `make` with no arguments runs the tests too.

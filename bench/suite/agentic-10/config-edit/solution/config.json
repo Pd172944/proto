@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "debug": false,
+  "server": {
+    "host": "localhost",
+    "port": 8080
+  },
+  "allowedHosts": ["localhost", "api.example.com"]
+}

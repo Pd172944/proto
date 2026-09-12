@@ -1,0 +1,1 @@
+Update `config.json` so the service config is current: set `version` to 2, turn `debug` off, and add `"api.example.com"` to `allowedHosts` while keeping `"localhost"` in that list. You can check your work with `python check_config.py`.

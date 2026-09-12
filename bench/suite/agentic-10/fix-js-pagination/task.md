@@ -1,0 +1,1 @@
+`paginate.js` returns the wrong slice of results for a requested page — for example, asking for page 1 returns the second page. Fix `paginate(items, page, perPage)` so page numbering starts at 1 and a page past the end returns an empty array, keeping the exported API unchanged. Run `node --test` in the workspace to see the visible tests.

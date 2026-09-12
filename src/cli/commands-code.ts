@@ -745,19 +745,20 @@ export const codeCommand: Command = {
           commands: result.commands,
         });
 
-        if (!print) {
-          out(
-            statusLine([
-              { key: 'steps', value: String(result.steps) },
-              { key: 'tokens', value: `${result.usage.inputTokens.toLocaleString()}↓ ${result.usage.outputTokens.toLocaleString()}↑` },
-              { key: 'cost', value: `$${turnCost.toFixed(4)}` },
-              { key: 'time', value: formatDuration(Date.now() - turnStart) },
-              ...(result.editedFiles.length > 0 ? [{ key: 'edited', value: result.editedFiles.join(' ') }] : []),
-              ...(result.ranVerification ? [{ key: 'verified', value: 'yes' }] : []),
-            ], termWidth()),
-          );
-          out('');
-        }
+        // Emitted in both modes: `chatter` sends it to stdout interactively and to
+        // stderr under `--print`, so a scripted caller can still learn the step count,
+        // token usage and cost of the turn without the answer being polluted.
+        chatter(
+          statusLine([
+            { key: 'steps', value: String(result.steps) },
+            { key: 'tokens', value: `${result.usage.inputTokens.toLocaleString()}↓ ${result.usage.outputTokens.toLocaleString()}↑` },
+            { key: 'cost', value: `$${turnCost.toFixed(4)}` },
+            { key: 'time', value: formatDuration(Date.now() - turnStart) },
+            ...(result.editedFiles.length > 0 ? [{ key: 'edited', value: result.editedFiles.join(' ') }] : []),
+            ...(result.ranVerification ? [{ key: 'verified', value: 'yes' }] : []),
+          ], termWidth()),
+        );
+        chatter('');
 
         // Escalate when the agent burned its whole step budget: being stuck is the one
         // signal from an agent turn that reliably means "this model is not up to it",

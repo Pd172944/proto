@@ -1,0 +1,8 @@
+2024-03-11T09:14:01Z INFO  http GET /health 200
+2024-03-11T09:14:02Z ERROR db  connection refused
+2024-03-11T09:14:03Z INFO  http GET /users 200
+2024-03-11T09:14:04Z WARN  cache miss for /users
+2024-03-11T09:14:05Z ERROR http GET /orders 500 upstream timeout
+2024-03-11T09:14:06Z DEBUG pool size 8
+2024-03-11T09:14:07Z ERROR db  deadlock detected on orders
+2024-03-11T09:14:08Z INFO  http GET /health 200

@@ -1,0 +1,1 @@
+Rename the function `calc_total` in `src/math_utils.py` to `compute_total`, and update every reference in `src/report.py` and `src/cli.py` so the code still behaves exactly the same. The old name must not survive anywhere, and the module layout and import style should stay as they are.

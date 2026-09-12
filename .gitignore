@@ -22,3 +22,10 @@ dist/
 .venv/
 __pycache__/
 *.pyc
+
+# The benchmark suite ships deliberate fixtures that the rules above would otherwise
+# swallow — a server log, and a build/ tree that exists precisely so a task can ask for
+# it to be ignored. Without these negations a fresh clone silently loses task data.
+!bench/suite/**/workspace/app.log
+!bench/suite/**/workspace/build/
+!bench/suite/**/workspace/build/**

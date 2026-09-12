@@ -1,0 +1,1 @@
+A recent commit in this repository deleted `docs/CHANGELOG.md`. Restore that file in the working tree with exactly the content it had before it was removed, using the repository's git history. Do not change any other file.
