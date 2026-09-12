@@ -27,6 +27,7 @@ import type {
 } from './types.ts';
 import type { Price } from '../config/schema.ts';
 import { joinUrl, request } from '../util/http.ts';
+import { transportProviderError } from './errors.ts';
 import { estimateTokens } from '../util/text.ts';
 import { toProviderError } from './openai.ts';
 
@@ -166,7 +167,12 @@ export class AnthropicProvider implements Provider {
         label: this.id,
       });
     } catch (err) {
-      throw toProviderError(this.id, err, this.baseUrl);
+      throw transportProviderError(err, {
+        providerId: this.id,
+        baseUrl: this.baseUrl,
+        kind: 'cloud',
+        timeoutMs: this.timeoutMs,
+      });
     }
     const latencyMs = Date.now() - started;
 
@@ -232,7 +238,14 @@ export class AnthropicProvider implements Provider {
           signal: controller.signal,
         });
       } catch (err) {
-        throw toProviderError(this.id, err, this.baseUrl);
+        // A streaming transport failure is the case a user is most likely to hit with a
+        // flaky connection, and it is where "fetch failed" was least helpful.
+        throw transportProviderError(err, {
+          providerId: this.id,
+          baseUrl: this.baseUrl,
+          kind: 'cloud',
+          timeoutMs: this.timeoutMs,
+        });
       }
 
       if (!res.ok) {

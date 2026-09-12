@@ -30,6 +30,38 @@ of corrupting a file.
 
 ---
 
+## `proto code` does not route — and that is deliberate
+
+There are two separate paths in this project, and conflating them is the easiest mistake
+to make:
+
+| Path | What it does | Uses the router? |
+|---|---|---|
+| `proto code` (and `proto-code`) | the interactive agent: one model, tool loop, approval prompts | **no** |
+| `proto run` / `proto route` | the batch two-regime path: features → quality floor → local/cloud tier → verify → escalate | **yes** |
+
+The agent uses exactly the model you selected with `--provider` / `--model` / `--local`,
+for the whole session. It does not consult task difficulty, does not pick a tier per
+turn, and does not escalate to a bigger model when it fails. Routing belongs to the
+batch path, where a task is a single self-contained unit that can be classified before
+any tokens are spent.
+
+Why: a routing decision needs a *task* to reason about, and an agent turn is not one —
+it is a conversation whose shape is unknown in advance. Switching models mid-turn would
+also break prompt caching and invalidate the provider's view of the conversation, which
+costs more than the routing saves.
+
+How to tell which model answered: the status line after each turn. Cloud shows a real
+cost, local shows `$0.0000`:
+
+```
+steps 3 · tokens 955↓ 531↑ · cost $0.0096 · time 23.6s · edited solution.py
+```
+
+`955↓ 531↑` tokens for `$0.0096` is a cloud model. The same turn on a local model would
+read `cost $0.0000`. `/model` inside a session switches models; `/cost` totals the
+session.
+
 ## The loop
 
 ```

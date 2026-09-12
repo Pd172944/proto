@@ -28,6 +28,7 @@ import type {
 } from './types.ts';
 import type { Price } from '../config/schema.ts';
 import { HttpError, joinUrl, request } from '../util/http.ts';
+import { diagnoseTransportError, transportProviderError } from './errors.ts';
 import { estimateTokens } from '../util/text.ts';
 
 export interface OpenAICompatibleOptions {
@@ -158,7 +159,7 @@ export class OpenAICompatibleProvider implements Provider {
         label: this.id,
       });
     } catch (err) {
-      throw toProviderError(this.id, err, this.baseUrl);
+      throw toProviderError(this.id, err, this.baseUrl, this.kind, this.timeoutMs);
     }
 
     const latencyMs = Date.now() - started;
@@ -644,15 +645,35 @@ function extractError(text: string): string {
   return text.slice(0, 300);
 }
 
-export function toProviderError(id: string, err: unknown, baseUrl: string): ProviderError {
+export function toProviderError(
+  id: string,
+  err: unknown,
+  baseUrl: string,
+  kind: 'cloud' | 'local' = 'cloud',
+  timeoutMs?: number,
+): ProviderError {
   if (err instanceof ProviderError) return err;
+  // `HttpError` already carries a status, but its message is `request failed after N
+  // attempt(s): fetch failed` — the same buried-cause problem, plus this branch used to
+  // drop the hint entirely, so a cloud outage produced no guidance at all.
   if (err instanceof HttpError) {
-    return new ProviderError(id, err.message, { status: err.status, retryable: err.retryable });
+    const diagnosis = diagnoseTransportError(err, {
+      providerId: id,
+      baseUrl,
+      kind,
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      ...(err.status ? { status: err.status } : {}),
+    });
+    return new ProviderError(id, diagnosis.message, {
+      status: err.status,
+      retryable: err.retryable,
+      hint: diagnosis.hint,
+    });
   }
-  const msg = err instanceof Error ? err.message : String(err);
-  const unreachable = /ECONNREFUSED|fetch failed|ENOTFOUND|aborted|timeout/i.test(msg);
-  return new ProviderError(id, msg, {
-    retryable: true,
-    hint: unreachable ? `Could not reach ${baseUrl}. Is the server running?` : undefined,
+  return transportProviderError(err, {
+    providerId: id,
+    baseUrl,
+    kind,
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
   });
 }
