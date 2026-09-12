@@ -313,3 +313,30 @@ describe('cli: introspection commands', () => {
     assert.ok(Object.keys(parsed.counts).length > 0);
   });
 });
+
+/**
+ * `--print` is the scripted interface, not the TUI: it must hand the caller the model's
+ * text exactly once, unwrapped and unstyled, so a shell can pipe it into a file or a
+ * diff without stripping rail markers out first.
+ */
+describe('proto code --print is scriptable', () => {
+  it('prints the final answer once, with no rail markers and no truncation', async () => {
+    const res = await cli(['code', '--demo', '--no-save', 'show me what this harness does'], {
+      env: { COLUMNS: '56', PROTO_COLOR: '0' },
+    });
+    assert.equal(res.code, 0, res.stderr);
+
+    const marker = 'That was the demo provider';
+    assert.equal(res.stdout.split(marker).length - 1, 1, `answer repeated or missing:\n${res.stdout}`);
+    assert.ok(!res.stdout.includes('| That was'), 'print mode leaked the TUI rail');
+    // Tool chatter belongs on stderr: `proto code --print ... > answer.md` must not get
+    // `+ read_file` lines spliced into the file.
+    assert.ok(!res.stdout.includes('read_file'), `chrome leaked into stdout:\n${res.stdout}`);
+    assert.ok(res.stderr.includes('read_file'), 'tool chatter should still be visible on stderr');
+    // Long lines survive: wrapping is a presentation choice, and this path has no terminal.
+    assert.ok(
+      res.stdout.split('\n').some((l) => [...l].length > 56),
+      'print mode should not re-wrap the answer for a terminal it does not have',
+    );
+  });
+});

@@ -51,11 +51,13 @@ export function resetColorMode(): void {
 
 export function colorEnabled(): boolean {
   if (forced !== null) return forced;
-  if (process.env['NO_COLOR']) return false;
-  // PROTO_COLOR=1 is the escape hatch for piping coloured output into a pager
-  // or a log viewer; PROTO_COLOR=0 mirrors it for symmetry.
+  // PROTO_COLOR is this program's own opt-in, typed by the person running it, so it
+  // outranks an inherited NO_COLOR. Without this ordering the escape hatch is
+  // unusable in exactly the situation it exists for: piping into a pager or a log
+  // viewer from a shell that exports NO_COLOR for every child process.
   if (process.env['PROTO_COLOR'] === '1') return true;
   if (process.env['PROTO_COLOR'] === '0') return false;
+  if (process.env['NO_COLOR']) return false;
   return process.stdout.isTTY === true;
 }
 
@@ -1174,3 +1176,647 @@ export function markdownLite(text: string, width: number): string {
     return text;
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* Charm-flavoured furniture                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Honour a caller's width exactly instead of clamping into the panel band the
+ * way `clampWidth` does.
+ *
+ * Chips, hint strips and activity lines are inline furniture sized by a caller
+ * that has already measured its slot; silently widening a 30-column slot to 40
+ * would overflow the row the caller was fitting into. Only non-finite input is
+ * rejected here.
+ */
+function exactWidth(width: number | undefined, fallback = DEFAULT_WIDTH): number {
+  if (width === undefined || !Number.isFinite(width)) return fallback;
+  return Math.max(1, Math.floor(width));
+}
+
+/**
+ * Terminal width for `wordmark`, the one new primitive that deliberately has no
+ * width argument. Columns are undefined when stdout is not a TTY, so we fall
+ * back to the module default rather than guessing.
+ */
+function terminalWidth(): number {
+  const cols = process.stdout.columns;
+  return typeof cols === 'number' && Number.isFinite(cols) && cols > 0 ? Math.floor(cols) : DEFAULT_WIDTH;
+}
+
+/** The six luminance levels of the xterm 6x6x6 colour cube. */
+const X256_LEVELS: readonly number[] = [0, 95, 135, 175, 215, 255];
+
+/** RGB for the sixteen system colours, used when a gradient endpoint is 0-15. */
+const X256_SYSTEM: ReadonlyArray<readonly [number, number, number]> = [
+  [0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0],
+  [0, 0, 128], [128, 0, 128], [0, 128, 128], [192, 192, 192],
+  [128, 128, 128], [255, 0, 0], [0, 255, 0], [255, 255, 0],
+  [0, 0, 255], [255, 0, 255], [0, 255, 255], [255, 255, 255],
+];
+
+const X256_BLACK: readonly [number, number, number] = [0, 0, 0];
+
+/** sRGB for one xterm-256 index, across the system, cube and grey-ramp bands. */
+function x256Rgb(n: number): readonly [number, number, number] {
+  if (n < 16) return X256_SYSTEM[n] ?? X256_BLACK;
+  if (n < 232) {
+    const m = n - 16;
+    return [
+      X256_LEVELS[Math.floor(m / 36)] ?? 0,
+      X256_LEVELS[Math.floor((m % 36) / 6)] ?? 0,
+      X256_LEVELS[m % 6] ?? 0,
+    ];
+  }
+  const v = 8 + (n - 232) * 10;
+  return [v, v, v];
+}
+
+/** Cube level index nearest to one channel value. */
+function nearestLevel(v: number): number {
+  let best = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < X256_LEVELS.length; i++) {
+    const dist = Math.abs((X256_LEVELS[i] ?? 0) - v);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/**
+ * Nearest xterm-256 index for an RGB triple.
+ *
+ * Both the 6x6x6 cube point and the grey-ramp point are considered, and the
+ * closer one wins; without the grey candidate a neutral mid-tone would snap to
+ * a saturated cube corner and band visibly.
+ */
+function rgbToX256(r: number, g: number, b: number): number {
+  const ri = nearestLevel(r);
+  const gi = nearestLevel(g);
+  const bi = nearestLevel(b);
+  const cr = X256_LEVELS[ri] ?? 0;
+  const cg = X256_LEVELS[gi] ?? 0;
+  const cb = X256_LEVELS[bi] ?? 0;
+  const cubeDist = (cr - r) ** 2 + (cg - g) ** 2 + (cb - b) ** 2;
+
+  const grey = (r + g + b) / 3;
+  const greyIdx = Math.max(232, Math.min(255, 232 + Math.round((grey - 8) / 10)));
+  const greyVal = 8 + (greyIdx - 232) * 10;
+  const greyDist = (greyVal - r) ** 2 + (greyVal - g) ** 2 + (greyVal - b) ** 2;
+
+  return greyDist < cubeDist ? greyIdx : 16 + 36 * ri + 6 * gi + bi;
+}
+
+/** Clamp an arbitrary number onto the 0-255 xterm index range. */
+function clamp256(n: number): number {
+  return Math.max(0, Math.min(255, Math.round(n)));
+}
+
+/**
+ * Nearest 16-colour SGR code for an xterm-256 index.
+ *
+ * Only reached on genuinely old terminals (`use256()` false). We turn the cube
+ * or grey-ramp index back into RGB and threshold it: crude, but it keeps a
+ * gradient from collapsing to one flat colour on a 16-colour terminal, and it
+ * never reaches for a dependency to do it.
+ */
+function x256To16(n: number): number {
+  if (n < 8) return 30 + n;
+  if (n < 16) return 90 + (n - 8);
+  const rgb = x256Rgb(n);
+  const bit = (v: number): number => (v > 95 ? 1 : 0);
+  const bright = Math.max(rgb[0], rgb[1], rgb[2]) > 170;
+  // Bit order matches ANSI: 1=red, 2=green, 4=blue.
+  return (bright ? 90 : 30) + bit(rgb[0]) + bit(rgb[1]) * 2 + bit(rgb[2]) * 4;
+}
+
+/** SGR parameter selecting one xterm-256 index (or its 16-colour stand-in). */
+function rampCode(n: number): string {
+  const idx = clamp256(n);
+  return use256() ? `38;5;${idx}` : String(x256To16(idx));
+}
+
+/**
+ * Per-character colour gradient across a 256-colour ramp. Points are the
+ * `xterm256` indices (e.g. 79, 179, 215); `from` and `to` may be given in either
+ * order. Returns the input unchanged when colour is disabled, when the text is
+ * empty, or when from === to.
+ *
+ * Interpolation happens in RGB, not in raw index space. Index order in the
+ * 6x6x6 cube snakes through hue bands, so a numeric 179 -> 79 walk would cut
+ * through magenta — exactly the Charm pink/purple the ember palette avoids —
+ * while an RGB walk from amber to teal stays in-family. Each step is mapped back
+ * to the nearest xterm index, and the two endpoints are pinned so `from` and
+ * `to` always appear literally at the ends.
+ *
+ * The ramp is computed over the whole string's visible width, not per line, so
+ * multi-line art stays continuous: each newline closes the current colour and
+ * the ramp count simply carries on at the next character. Wide characters
+ * advance the ramp by 2 positions to stay consistent with `visibleWidth`.
+ */
+export function gradient(text: string, from: number, to: number): string {
+  // `plain` keeps the zero-ANSI guarantee for pre-coloured input when colour is
+  // off; when it is on we re-colour anyway, so existing escapes are ignored by
+  // the zero-width branch below.
+  const src = plain(text);
+  if (src === '' || !colorEnabled() || from === to) return src;
+  if (!Number.isFinite(from) || !Number.isFinite(to)) return src;
+
+  const first = clamp256(from);
+  const last = clamp256(to);
+  const fromRgb = x256Rgb(first);
+  const toRgb = x256Rgb(last);
+  const total = visibleWidth(src);
+  const span = Math.max(1, total - 1);
+  const out: string[] = [];
+  let pos = 0;
+  let open = false;
+  let i = 0;
+
+  while (i < src.length) {
+    const unit = graphemeAt(src, i);
+    if (unit.next <= i) break;
+    const chunk = src.slice(i, unit.next);
+    i = unit.next;
+
+    if (chunk === '\n') {
+      if (open) {
+        out.push('\u001b[0m');
+        open = false;
+      }
+      out.push(chunk);
+      continue;
+    }
+
+    // Zero-width units are a leading escape, a combining mark, or the ZWJ tail
+    // of an emoji sequence. Emitting an SGR in the middle of a ZWJ sequence
+    // would break the glyph apart in some terminals, so they ride along with
+    // the colour already open.
+    if (unit.width === 0) {
+      out.push(chunk);
+      continue;
+    }
+
+    const t = total <= 1 ? 0 : pos / span;
+    const step =
+      pos === 0
+        ? first
+        : pos >= span
+          ? last
+          : rgbToX256(
+              fromRgb[0] + (toRgb[0] - fromRgb[0]) * t,
+              fromRgb[1] + (toRgb[1] - fromRgb[1]) * t,
+              fromRgb[2] + (toRgb[2] - fromRgb[2]) * t,
+            );
+    out.push(`\u001b[${rampCode(step)}m`, chunk);
+    open = true;
+    pos += unit.width;
+  }
+
+  if (open) out.push('\u001b[0m');
+  return out.join('');
+}
+
+/**
+ * Compact 5-row block font, one glyph per entry, rows separated by `/`.
+ *
+ * Lowercase maps onto the same small-caps shapes so the art has one predictable
+ * width (5 columns + a 1-column gap per letter) instead of needing a second
+ * alphabet. Anything not in the table makes `blockArt` return null and the
+ * caller falls back to plain text, which is safer than drawing blanks.
+ */
+const BLOCK_FONT: Record<string, string> = {
+  a: ' ### /#   #/#####/#   #/#   #',
+  b: '#### /#   #/#### /#   #/#### ',
+  c: ' ####/#    /#    /#    / ####',
+  d: '#### /#   #/#   #/#   #/#### ',
+  e: '#####/#    /#### /#    /#####',
+  f: '#####/#    /#### /#    /#    ',
+  g: ' ####/#    /#  ##/#   #/ ####',
+  h: '#   #/#   #/#####/#   #/#   #',
+  i: '#####/  #  /  #  /  #  /#####',
+  j: '    #/    #/    #/#   #/ ### ',
+  k: '#   #/#  # /###  /#  # /#   #',
+  l: '#    /#    /#    /#    /#####',
+  m: '#   #/## ##/# # #/#   #/#   #',
+  n: '#   #/##  #/# # #/#  ##/#   #',
+  o: ' ### /#   #/#   #/#   #/ ### ',
+  p: '#### /#   #/#### /#    /#    ',
+  q: ' ### /#   #/#   #/#  # / ## #',
+  r: '#### /#   #/#### /#  # /#   #',
+  s: ' ####/#    / ### /    #/#### ',
+  t: '#####/  #  /  #  /  #  /  #  ',
+  u: '#   #/#   #/#   #/#   #/ ### ',
+  v: '#   #/#   #/#   #/ # # /  #  ',
+  w: '#   #/#   #/# # #/## ##/#   #',
+  x: '#   #/ # # /  #  / # # /#   #',
+  y: '#   #/ # # /  #  /  #  /  #  ',
+  z: '#####/   # /  #  / #   /#####',
+  '0': ' ### /#  ##/# # #/##  #/ ### ',
+  '1': '  #  / ##  /  #  /  #  / ### ',
+  '2': ' ### /#   #/  ## / #   /#####',
+  '3': '#### /    #/ ### /    #/#### ',
+  '4': '#  # /#  # /#####/   # /   # ',
+  '5': '#####/#    /#### /    #/#### ',
+  '6': ' ### /#    /#### /#   #/ ### ',
+  '7': '#####/   # /  #  / #   /#    ',
+  '8': ' ### /#   #/ ### /#   #/ ### ',
+  '9': ' ### /#   #/ ####/    #/ ### ',
+  ' ': '   /   /   /   /   ',
+  '.': ' / / / /#',
+  ':': ' /#/ /#/ ',
+  '-': '     /     /#####/     /     ',
+  _: '     /     /     /     /#####',
+  '+': '     /  #  /#####/  #  /     ',
+  '/': '    #/   # /  #  / #   /#    ',
+  '!': '  #  /  #  /  #  /     /  #  ',
+  '?': ' ### /#   #/  ## /     /  #  ',
+  "'": '  #  /  #  /     /     /     ',
+  '(': '  #  / #   / #   / #   /  #  ',
+  ')': '  #  /   # /   # /   # /  #  ',
+};
+
+/** Five rows of block art for `text`, or null when a character has no glyph. */
+function blockArt(text: string): string | null {
+  const shapes: string[][] = [];
+  for (const ch of text) {
+    const def = BLOCK_FONT[ch.toLowerCase()];
+    if (def === undefined) return null;
+    const rows = def.split('/');
+    const w = Math.max(...rows.map((r) => r.length));
+    shapes.push(rows.map((r) => r.padEnd(w, ' ')));
+  }
+  if (shapes.length === 0) return null;
+
+  const lines: string[] = [];
+  for (let r = 0; r < 5; r++) lines.push(shapes.map((s) => s[r] ?? '').join(' '));
+  return lines.join('\n');
+}
+
+/** The no-art wordmark: title-cased text, still styled when colour is on. */
+function wordmarkPlain(text: string): string {
+  const titled = text.replace(/\S+/g, (word) => word.charAt(0).toUpperCase() + word.slice(1));
+  return colorEnabled() ? palette.primary(palette.bold(titled)) : titled;
+}
+
+/**
+ * A large block wordmark for the app header, drawn with a gradient across the
+ * whole word rather than per line so the ramp is continuous. Default text "proto".
+ * Falls back to the plain text (title-cased, no art) when colour is disabled or the
+ * terminal is narrower than the art plus padding.
+ *
+ * The ramp runs ember -> deep water (primary 179 -> accent 79), which is the
+ * theme's own signature rather than Charm's pink/purple.
+ */
+export function wordmark(text = 'proto'): string {
+  const raw = plain(text).trim();
+  if (raw === '') return '';
+
+  // Colour off is a hard fallback: no art at all, per the plain-text guarantee.
+  const art = colorEnabled() ? blockArt(raw) : null;
+  if (art === null) return wordmarkPlain(raw);
+
+  const artW = Math.max(...art.split('\n').map((line) => visibleWidth(line)));
+  // Two columns of air on each side keeps the art from touching the frame it is
+  // usually dropped into (the welcome panel).
+  if (artW + 4 > terminalWidth()) return wordmarkPlain(raw);
+
+  return gradient(art, 179, 79);
+}
+
+/** Information shown in the welcome panel: reuse the existing KeyValue shape. */
+export interface WelcomeOptions {
+  subtitle?: string;
+  width?: number;
+}
+
+/**
+ * The session opening panel: a gradient wordmark, a subtitle, a rule, and a
+ * key/value block, inside a rounded frame with padding. This replaces the plain
+ * `banner(...)` + `kv(...)` pair used at startup.
+ *
+ * Composition rather than a bespoke frame: `box` already owns the rounded/ASCII
+ * border, the padding and the width clamping, and its interior padding is what
+ * gives the panel the unhurried gum-like inset.
+ */
+export function welcomePanel(info: KeyValue[], opts: WelcomeOptions = {}): string {
+  const width = clampWidth(opts.width);
+  const pad = 1;
+  const contentW = Math.max(1, width - 2 - pad * 2);
+  const body: string[] = [];
+
+  // Art is only usable if it survives the panel's own interior width; a
+  // terminal narrower than the panel would otherwise hand us a wordmark that
+  // `box` hard-breaks down the middle of a letter.
+  const art = wordmark();
+  const artLines = art.split('\n');
+  body.push(artLines.every((line) => visibleWidth(line) <= contentW) ? art : wordmarkPlain('proto'));
+
+  const subtitle = opts.subtitle === undefined ? '' : oneLineVisible(plain(opts.subtitle));
+  if (subtitle !== '') {
+    body.push('');
+    body.push(palette.dim(subtitle));
+  }
+
+  // `rule` predates the plain-ASCII guarantee and always emits U+2500, so the
+  // panel borrows `turnDivider`, which picks `-` when colour is off.
+  body.push(turnDivider(undefined, contentW));
+  if (info.length > 0) {
+    body.push('');
+    body.push(kv(info));
+  }
+
+  return box('', body.join('\n'), { width, padding: pad });
+}
+
+/** Heavy vertical bar: a deliberate quote rail rather than a hairline divider. */
+const RAIL_MARK = '\u2503'; // ┃
+
+/**
+ * Render text as a block with a vertical accent rail down the left edge, the way a
+ * chat bubble reads. Preserves line structure, wraps to `width` minus the rail, and
+ * leaves no trailing spaces. `marker` defaults to a heavy vertical bar, falling back
+ * to "|" without colour.
+ *
+ * Every line is padded to exactly `width` visible columns so the block has a
+ * single, assertable right edge; the only whitespace a line can end with is
+ * that layout padding, because `wrap` has already trimmed the content itself.
+ */
+export function rail(
+  text: string,
+  opts: { width: number; accent?: keyof Palette; marker?: string },
+): string {
+  const width = exactWidth(opts.width);
+  const colored = colorEnabled();
+  const mark = opts.marker !== undefined ? plain(opts.marker) : colored ? RAIL_MARK : '|';
+  const markW = Math.max(1, visibleWidth(mark));
+  const contentW = Math.max(1, width - markW - 1);
+  const accent = palette[opts.accent ?? 'accent'] ?? palette.accent;
+
+  const pieces: string[] = [];
+  for (const line of plain(text).split('\n')) pieces.push(...wrap(line, contentW));
+  if (pieces.length === 0) pieces.push('');
+
+  return pieces
+    .map((piece) => {
+      const pad = Math.max(0, contentW - visibleWidth(piece));
+      return accent(mark) + ' ' + palette.text(piece) + ' '.repeat(pad);
+    })
+    .join('\n');
+}
+
+/** The ASCII stand-ins `chip` uses when colour (and therefore glyphs) is off. */
+const CHIP_STATES: Record<'ok' | 'fail' | 'run', { accent: keyof Palette; mark: string; ascii: string }> = {
+  ok: { accent: 'success', mark: glyph.check, ascii: '+' },
+  fail: { accent: 'error', mark: glyph.cross, ascii: 'x' },
+  run: { accent: 'accent', mark: glyph.arrow, ascii: '>' },
+};
+
+/**
+ * A one-line tool-call chip, e.g.  "✓ read_file  src/app.ts  12ms".
+ * `state` picks the colour and glyph. `detail` is right-aligned when there is room
+ * and dropped entirely when there is not. Never exceeds `width`.
+ *
+ * "Room" means at least two columns of separation between label and detail; a
+ * single space would read as one run-on token, so the detail is dropped instead
+ * of being crammed in.
+ */
+export function chip(
+  state: 'ok' | 'fail' | 'run',
+  label: string,
+  detail?: string,
+  opts: { width?: number } = {},
+): string {
+  const w = exactWidth(opts.width);
+  const colored = colorEnabled();
+  const spec = CHIP_STATES[state] ?? CHIP_STATES.run;
+  const mark = colored ? spec.mark : spec.ascii;
+  const lab = oneLineVisible(plain(label));
+  const det = detail === undefined ? '' : oneLineVisible(plain(detail));
+
+  const headW = 2; // marker + one space
+  const shownLab = truncVisible(lab, Math.max(0, w - headW));
+  const leftW = headW + visibleWidth(shownLab);
+  let line = palette[spec.accent](mark) + ' ' + palette.text(shownLab);
+
+  // The detail is right-aligned, and truncated rather than dropped: a chip that says
+  // only `run_command` hides the one thing the reader wants — what it printed, or why
+  // it failed. Dropping it silently was worse than an ellipsis.
+  if (det !== '') {
+    const room = w - leftW - 2; // two columns of separation from the label
+    if (room >= 8) {
+      const shownDet = truncVisible(det, room);
+      const pad = w - leftW - visibleWidth(shownDet);
+      if (pad >= 1) line += ' '.repeat(pad) + palette.dim(shownDet);
+    }
+  }
+
+  return visibleWidth(line) > w ? truncVisible(line, w) : line;
+}
+
+/** ASCII spinner for plain output: braille must never reach a colourless log. */
+const ASCII_SPINNER: readonly string[] = ['|', '/', '-', '\\'];
+
+function asciiSpinner(index: number): string {
+  const i = Number.isFinite(index) ? Math.floor(index) : 0;
+  const n = ASCII_SPINNER.length;
+  return ASCII_SPINNER[((i % n) + n) % n] ?? '|';
+}
+
+/** Elapsed time as `m:ss`, which reads the same at 4s and at 40 minutes. */
+function formatElapsed(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+/** Four decimals below a dollar so sub-cent costs stay legible, two above. */
+function formatCost(usd: number): string {
+  return usd >= 1 ? `$${usd.toFixed(2)}` : `$${usd.toFixed(4)}`;
+}
+
+/**
+ * The live activity line shown while the model is working:
+ *   "⠹ thinking…  0:04  ·  412 tok  ·  $0.0031"
+ * Right-hand parts are dropped from the right as width shrinks, so the spinner and
+ * label always survive. `frame` selects the spinner glyph via the existing
+ * `spinnerFrame`. With colour disabled, use plain ASCII spinner frames and no glyphs.
+ *
+ * The elapsed part stays welded to the label with two spaces; tokens and cost are
+ * separate dot-joined cells. That ordering is exactly the drop order (cost,
+ * tokens, elapsed), so `parts.pop()` degrades the line from the right.
+ */
+export function activityLine(input: {
+  frame: number;
+  label: string;
+  elapsedMs?: number;
+  tokensOut?: number;
+  costUsd?: number;
+  width?: number;
+}): string {
+  const w = exactWidth(input.width);
+  const colored = colorEnabled();
+  const spin = colored ? spinnerFrame(input.frame) : asciiSpinner(input.frame);
+  const lab = oneLineVisible(plain(input.label));
+  const shownLab = truncVisible(lab, Math.max(0, w - 2));
+  const core = palette.accent(spin) + ' ' + palette.thinking(shownLab);
+  const sep = colored ? ' ' + palette.border(glyph.dot) + ' ' : ' | ';
+
+  const parts: string[] = [];
+  if (input.elapsedMs !== undefined && Number.isFinite(input.elapsedMs) && input.elapsedMs >= 0) {
+    parts.push('  ' + palette.dim(formatElapsed(input.elapsedMs)));
+  }
+  if (input.tokensOut !== undefined && Number.isFinite(input.tokensOut) && input.tokensOut >= 0) {
+    parts.push(sep + palette.text(`${Math.floor(input.tokensOut)} tok`));
+  }
+  if (input.costUsd !== undefined && Number.isFinite(input.costUsd) && input.costUsd >= 0) {
+    parts.push(sep + palette.warn(formatCost(input.costUsd)));
+  }
+
+  while (parts.length > 0 && visibleWidth(core + parts.join('')) > w) parts.pop();
+  const line = core + parts.join('');
+  return visibleWidth(line) > w ? truncVisible(line, w) : line;
+}
+
+/**
+ * A "key  label" hint strip for the footer, e.g.  "⏎ send   ^C stop   /help".
+ *
+ * Hints are whole units: a hint that does not fit is dropped rather than cut, so
+ * a footer never shows half a shortcut. The only exception is the very first
+ * hint when even it is too wide, where something legible beats an empty line.
+ */
+export function footerHints(items: Array<{ key: string; label: string }>, width?: number): string {
+  const w = exactWidth(width);
+  const colored = colorEnabled();
+  const sep = colored ? ' ' + palette.border(glyph.dot) + ' ' : ' | ';
+
+  const cells = items
+    .map((item) => {
+      const key = oneLineVisible(plain(item.key));
+      const label = oneLineVisible(plain(item.label));
+      const text = label === '' ? key : `${key} ${label}`;
+      const rendered = label === '' ? palette.accent(key) : palette.accent(key) + ' ' + palette.dim(label);
+      return { text, rendered };
+    })
+    .filter((cell) => cell.text !== '');
+
+  const chosen: string[] = [];
+  let used = 0;
+  for (const cell of cells) {
+    const add = (chosen.length === 0 ? 0 : visibleWidth(sep)) + visibleWidth(cell.text);
+    if (used + add > w) break;
+    chosen.push(cell.rendered);
+    used += add;
+  }
+
+  if (chosen.length === 0) {
+    const first = cells[0];
+    return first === undefined ? '' : truncVisible(first.rendered, w);
+  }
+  return chosen.join(sep);
+}
+
+/**
+ * A subtle labelled separator between turns, e.g. "──── turn 3 ────".
+ *
+ * The label is centred with one space of air either side and the dashes split
+ * the remainder, so the divider always measures exactly `width` columns. With
+ * no room for even that, it degrades to a plain rule rather than a mangled label.
+ */
+export function turnDivider(label?: string, width?: number): string {
+  const w = exactWidth(width);
+  const dash = colorEnabled() ? glyph.horizontal : '-';
+  const text = label === undefined ? '' : oneLineVisible(plain(label));
+  if (text === '') return palette.border(dash.repeat(w));
+
+  const shown = truncVisible(text, Math.max(0, w - 4));
+  const remaining = w - visibleWidth(shown) - 2;
+  if (remaining < 2) return palette.border(dash.repeat(w));
+
+  const left = Math.floor(remaining / 2);
+  const right = remaining - left;
+  return palette.border(dash.repeat(left)) + ' ' + palette.dim(shown) + ' ' + palette.border(dash.repeat(right));
+}
+
+/** A stateful writer that renders a stream of assistant text inside a rail. */
+export interface RailWriter {
+  /** Feed a chunk of streamed text. Partial lines are held back until they complete. */
+  write(text: string): void;
+  /** Flush whatever is still pending. Call once when the turn ends. */
+  end(): void;
+}
+
+/**
+ * Render a *stream* of assistant text inside the same rail `rail()` draws for a finished
+ * block, wrapping it to `width` as it goes.
+ *
+ * A plain prefix-per-chunk cannot work: chunks split mid-word, and the terminal's own
+ * soft-wrap puts continuation lines outside the rail, so the marker appears once and the
+ * rest of the paragraph hangs off the left margin. This wraps greedily and holds back the
+ * last partial line — at most one line of latency, and every emitted line carries the
+ * marker. Hard newlines in the model's output are preserved as paragraph breaks.
+ */
+export function createRailWriter(width: number, sink: (text: string) => void): RailWriter {
+  const colored = colorEnabled();
+  const mark = colored ? RAIL_MARK : '|';
+  const contentW = Math.max(8, exactWidth(width) - visibleWidth(mark) - 1);
+  let pending = '';
+
+  const emit = (body: string): void => {
+    if (body === '') sink('\n');
+    else sink(`${colored ? palette.accent(mark) : mark} ${body}\n`);
+  };
+
+  /** Pull every line that is already complete out of `pending`. */
+  const drain = (force: boolean): void => {
+    for (;;) {
+      const nl = pending.indexOf('\n');
+      if (nl >= 0) {
+        emit(pending.slice(0, nl).replace(/[ \t]+$/, ''));
+        pending = pending.slice(nl + 1);
+        continue;
+      }
+      if (visibleWidth(pending) <= contentW) {
+        if (force && pending !== '') emit(pending.replace(/[ \t]+$/, ''));
+        return;
+      }
+      const cut = railBreakPoint(pending, contentW);
+      emit(pending.slice(0, cut).replace(/[ \t]+$/, ''));
+      pending = pending.slice(cut).replace(/^[ \t]+/, '');
+    }
+  };
+
+  return {
+    write(text: string): void {
+      if (text === '') return;
+      pending += text;
+      drain(false);
+    },
+    end(): void {
+      drain(true);
+    },
+  };
+}
+
+/**
+ * Index at which to split `s` so the first piece fits in `width` visible columns.
+ * Prefers the last space; falls back to a hard cut when a single token (a path, a URL,
+ * a shell command) is wider than the content area.
+ */
+function railBreakPoint(s: string, width: number): number {
+  const chars = [...s];
+  let seen = 0;
+  let lastSpace = -1;
+  for (let i = 0; i < chars.length; i++) {
+    if (seen >= width) return lastSpace > 0 ? lastSpace : i;
+    if (chars[i] === ' ') lastSpace = i;
+    seen += visibleWidth(chars[i] as string);
+  }
+  return chars.length;
+}
+
