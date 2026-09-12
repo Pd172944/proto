@@ -216,8 +216,12 @@ export function evaluateGates(input: GateInput): GateResult {
 export interface SessionPlan {
   /** Wall-clock cap for this session. */
   maxRuntimeMin: number;
-  /** Iterations to run, scaled down if the session is short. */
+  /** Optimisation steps this session will take. */
   iters: number;
+  /** Training rows available to the session. */
+  sampleCount: number;
+  /** Passes over the training set the step budget buys (the number that matters). */
+  effectiveEpochs: number;
   mode: 'sft' | 'dpo';
   reason: string;
 }
@@ -225,29 +229,70 @@ export interface SessionPlan {
 /**
  * Plan a session.
  *
- * Iterations are scaled by how much time is actually available, because `iters`
- * tuned for a 20-minute window is wrong for a 5-minute one. Under-shooting costs
- * nothing (the next night continues); over-shooting means a killed process and a
- * wasted night.
+ * Two things drive this, and getting either wrong makes training pointless:
+ *
+ *  1. **Steps must come from the data, not from a fixed number.** The old design
+ *     hard-coded 60 iterations. At batch size 1 that shows the model 60 examples;
+ *     on a 400-row dataset it is 15% of a single epoch, so the run could not teach
+ *     anything regardless of how good the data was. Steps are now derived from a
+ *     target number of *epochs* over the actual dataset.
+ *
+ *  2. **The wall-clock budget caps it, and the budget is small.** A laptop night
+ *     is minutes, not hours. The plan therefore reports `effectiveEpochs` so that
+ *     `proto train status` can say plainly whether a session will actually learn
+ *     from the data or merely skim it.
+ *
+ * Seconds-per-step is measured from past jobs when available, because a guessed
+ * constant makes the whole plan fictional. `train.secondsPerStep` is only the
+ * fallback for the first run.
  */
-export function planSession(cfg: ProtoConfig, minutesUsedToday: number, mode?: 'sft' | 'dpo'): SessionPlan {
+export function planSession(
+  cfg: ProtoConfig,
+  minutesUsedToday: number,
+  mode?: 'sft' | 'dpo',
+  sampleCount = 0,
+  secondsPerStep?: number,
+): SessionPlan {
   const remaining = Math.max(1, cfg.train.dailyBudgetMin - minutesUsedToday);
   const maxRuntimeMin = Math.min(cfg.train.maxRuntimeMin, remaining);
-  const configured = cfg.train.lora.iters;
-  // Assume roughly 6 seconds per iteration at this LoRA size on Apple Silicon
-  // (measured on an M-series laptop with a 1.5B 4-bit model). Deliberately
-  // pessimistic: better to stop early than to be killed mid-run.
-  const affordable = Math.floor((maxRuntimeMin * 60) / 6);
-  const iters = Math.max(5, Math.min(configured, affordable));
+  const batchSize = Math.max(1, cfg.train.lora.batchSize);
+  const perStep = Math.max(0.05, secondsPerStep ?? cfg.train.secondsPerStep);
+
+  const rows = Math.max(1, sampleCount);
+  const desired = Math.ceil((cfg.train.lora.epochs * rows) / batchSize);
+  const capped = Math.min(desired, cfg.train.lora.maxIters);
+  const affordable = Math.floor((maxRuntimeMin * 60) / perStep);
+  const iters = Math.max(1, Math.min(capped, affordable));
+  const effectiveEpochs = (iters * batchSize) / rows;
+
   const chosenMode = mode ?? cfg.train.lora.mode;
+  const reasons: string[] = [];
+  if (sampleCount === 0) {
+    reasons.push('no rows yet, so the step count is nominal');
+  } else if (iters < desired) {
+    reasons.push(
+      `time budget allows ${iters} of the ${desired} steps needed for ${cfg.train.lora.epochs} epoch(s) ` +
+        `(${perStep.toFixed(1)}s/step measured); the run will see ${(effectiveEpochs * 100).toFixed(0)}% of the data once`,
+    );
+  } else {
+    reasons.push(
+      `${iters} step(s) at batch ${batchSize} gives ${effectiveEpochs.toFixed(1)} epoch(s) over ${rows} row(s)`,
+    );
+  }
+  if (effectiveEpochs < 1) {
+    reasons.push(
+      'WARNING: under one epoch — the model will not see all of the data, so expect drift rather than learning. ' +
+        'Raise train.maxRuntimeMin (overnight) or collect more consistent examples.',
+    );
+  }
+
   return {
     maxRuntimeMin,
     iters,
+    sampleCount,
+    effectiveEpochs,
     mode: chosenMode,
-    reason:
-      iters < configured
-        ? `reduced iterations from ${configured} to ${iters} to fit ${maxRuntimeMin} available minute(s)`
-        : `${iters} iteration(s) fit comfortably in ${maxRuntimeMin} minute(s)`,
+    reason: reasons.join('; '),
   };
 }
 

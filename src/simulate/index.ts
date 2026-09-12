@@ -313,7 +313,11 @@ export function simulate(cfg: ProtoConfig, dataDir: string, opts: SimulateOption
   const results: SimulateCheckpoint[] = [];
 
   const snapshot = (atTasks: number): SimulateCheckpoint => {
-    const datasets = buildDatasets(store, cfg, { write: false });
+    const datasets = buildDatasets(store, cfg, {
+      write: false,
+      maxSft: cfg.train.maxSftSamples,
+      maxDpo: cfg.train.maxDpoSamples,
+    });
     const samples = datasets.router.samples.map((s) => ({ x: s.x, y: s.y, w: s.w }));
     const distinctClasses = new Set(datasets.router.samples.map((s) => s.meta.taskClass)).size;
 
@@ -543,7 +547,7 @@ export function simulate(cfg: ProtoConfig, dataDir: string, opts: SimulateOption
       'Ground-truth labels are used for evaluation, while the system trains on verification verdicts, so the gap between "true-ok" and "verified" is the verifier error rate.',
       'This is a model of the system, not a measurement of a specific checkpoint. Read the slopes as informative and the levels as a scenario.',
     ],
-    interpretation: interpret(results, truth),
+    interpretation: interpret(results, truth, cfg.train.lora),
   };
 }
 
@@ -559,7 +563,7 @@ function routeAccuracy(rows: HeldoutRow[], score: (r: HeldoutRow) => number, flo
   return correct / rows.length;
 }
 
-function interpret(rows: SimulateCheckpoint[], truth: TruthModel): string[] {
+function interpret(rows: SimulateCheckpoint[], truth: TruthModel, lora: ProtoConfig['train']['lora']): string[] {
   const out: string[] = [];
   const last = rows[rows.length - 1];
   if (!last) return out;
@@ -592,10 +596,22 @@ function interpret(rows: SimulateCheckpoint[], truth: TruthModel): string[] {
     `LoRA side after ${last.tasks} tasks: ${last.sftSamples} SFT sample(s) (verified local wins plus distilled cloud ` +
       `wins) and ${last.dpoPairs} preference pair(s) across ${last.sftDistinctClasses} task class(es).`,
   );
-  if (last.dpoPairs < 100) {
+  // Steps and epochs, not row counts, decide whether fine-tuning can learn
+  // anything. A row count without them is the number people quote and the one
+  // that means least.
+  const batchSize = Math.max(1, lora.batchSize);
+  const epochs = (iters: number, rows: number): number => (iters * batchSize) / Math.max(1, rows);
+  const sftIters = Math.min(lora.maxIters, Math.ceil((lora.epochs * last.sftSamples) / batchSize));
+  const dpoIters = Math.min(lora.maxIters, Math.ceil((lora.epochs * last.dpoPairs) / batchSize));
+  out.push(
+    `At the default ${lora.epochs}-epoch target that is ${sftIters} SFT step(s) ` +
+      `(${epochs(sftIters, last.sftSamples).toFixed(1)} epoch) or ${dpoIters} DPO step(s) ` +
+      `(${epochs(dpoIters, last.dpoPairs).toFixed(1)} epoch) at batch ${batchSize}.`,
+  );
+  if (last.dpoPairs < 200) {
     out.push(
-      'That is well below the few-hundred-to-low-thousands of consistent examples where LoRA visibly changes ' +
-        'behaviour. Treat the adapter as a nudge toward your conventions on repeated task shapes, not a capability upgrade.',
+      'That is still thin. Preference tuning generally needs several hundred consistent pairs before behaviour ' +
+        'visibly changes, so expect drift toward your conventions rather than a capability jump.',
     );
   }
   if (last.falsePassRate > 0.02) {

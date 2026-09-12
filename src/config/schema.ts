@@ -350,11 +350,37 @@ export interface TrainConfig {
     dropout: number;
     learningRate: number;
     batchSize: number;
-    iters: number;
+    /**
+     * Target number of passes over the training set.
+     *
+     * This replaces the old fixed `iters` knob. A step count is meaningless
+     * without knowing how much data exists: 60 iterations at batch size 1 shows
+     * the model 60 examples, which on a 400-row dataset is 15% of a single epoch
+     * and cannot teach anything. What actually matters is how many times the model
+     * sees the data, so that is what is configured.
+     */
+    epochs: number;
+    /** Hard ceiling on optimisation steps, whatever the epoch target implies. */
+    maxIters: number;
     maxSeqLen: number;
     /** Which training mode to use for the selected dataset. */
     mode: 'sft' | 'dpo';
   };
+  /**
+   * Cap on training rows per run.
+   *
+   * Deliberately separate from the `datasets build` caps: those exist so a human
+   * can inspect a bounded sample, whereas these decide how much of your history
+   * actually reaches the model. Discarding rows buys nothing.
+   */
+  maxSftSamples: number;
+  maxDpoSamples: number;
+  /**
+   * Fallback seconds per optimisation step, used to size a session against the
+   * time budget before any history exists. Once jobs have run, the scheduler
+   * measures the real rate from their recorded duration and ignores this.
+   */
+  secondsPerStep: number;
   /** Keep at most this many adapters on disk. */
   keepAdapters: number;
   /** Auto-promote a freshly trained adapter to the serving runtime. */
@@ -480,11 +506,17 @@ export const DEFAULT_CONFIG: ProtoConfig = {
       scale: 16,
       dropout: 0.05,
       learningRate: 1e-5,
-      batchSize: 1,
-      iters: 60,
+      // Batch 4 rather than 1: a single-example gradient is mostly noise, so the
+      // step budget is better spent on fewer, better-conditioned updates.
+      batchSize: 4,
+      epochs: 3,
+      maxIters: 2000,
       maxSeqLen: 1024,
       mode: 'sft',
     },
+    maxSftSamples: 2000,
+    maxDpoSamples: 1000,
+    secondsPerStep: 1.5,
     keepAdapters: 3,
     autoPromote: false,
   },

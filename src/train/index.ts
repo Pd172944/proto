@@ -25,7 +25,14 @@ import { rmSync } from 'node:fs';
 import { adaptersRoot, getActiveAdapter, listAdapters, setActiveAdapter, writeAdapterMetrics } from './adapter.ts';
 import { JobQueue, addMinutes, loadTrainState, minutesUsedToday, saveTrainState } from './jobs.ts';
 import type { TrainJob, TrainState } from './jobs.ts';
-import { buildLoraCommand, newAdapterPath, preflight, prepareMlxDataDir, runTraining, serveCommands } from './mlx.ts';
+import {
+  buildLoraCommand,
+  newAdapterPath,
+  preflight,
+  prepareMlxDataDirFromSamples,
+  runTraining,
+  serveCommands,
+} from './mlx.ts';
 import type { MlxPreflight } from './mlx.ts';
 import { evaluateGates, planSession, priorityPlan, readSystemState } from './scheduler.ts';
 import type { GateResult, SessionPlan, SystemState } from './scheduler.ts';
@@ -175,9 +182,15 @@ export async function trainStatus(cfg: ProtoConfig, dataDir: string, now: Date =
     hasTrainingData: datasets.sft.samples.length > 0 || datasets.dpo.samples.length > 0,
   };
   const gates = evaluateGates(gateInput);
-  const plan = planSession(cfg, minutesToday, cfg.train.lora.mode);
   const pf = await preflight(dataDir);
   const queue = new JobQueue(dataDir);
+  const plan = planSession(
+    cfg,
+    minutesToday,
+    cfg.train.lora.mode,
+    trainingRowCount(datasets, cfg.train.lora.mode),
+    measuredSecondsPerStep(cfg, queue),
+  );
 
   return {
     enabled: cfg.train.enabled,
@@ -197,6 +210,35 @@ export async function trainStatus(cfg: ProtoConfig, dataDir: string, now: Date =
     baseModel: cfg.train.baseModel,
     readyToRun: gates.allowed && pf.ok,
   };
+}
+
+/**
+ * How many rows the chosen training mode would actually use, after the training
+ * caps are applied. Reporting a plan against the wrong row count would make the
+ * epoch estimate meaningless.
+ */
+function trainingRowCount(datasets: BuiltDatasets, mode: 'sft' | 'dpo'): number {
+  return mode === 'dpo' ? datasets.dpo.samples.length : datasets.sft.samples.length;
+}
+
+/**
+ * Seconds per optimisation step, measured from completed jobs.
+ *
+ * A guessed constant makes the session plan fiction: it decides how many steps
+ * fit in the night. Past runs record their step count and wall-clock duration, so
+ * once there is history the scheduler stops guessing and uses the median of what
+ * actually happened on this machine.
+ */
+export function measuredSecondsPerStep(cfg: ProtoConfig, queue: JobQueue): number {
+  const rates: number[] = [];
+  for (const job of queue.all()) {
+    if (job.status !== 'done' || !job.durationMs || !job.plan?.iters) continue;
+    if (job.durationMs < 1000) continue;
+    rates.push(job.durationMs / 1000 / job.plan.iters);
+  }
+  if (rates.length === 0) return cfg.train.secondsPerStep;
+  rates.sort((a, b) => a - b);
+  return rates[Math.floor(rates.length / 2)] as number;
 }
 
 function countNewEpisodes(dataDir: string, state: TrainState): number {
@@ -227,7 +269,7 @@ export interface TickOptions {
 }
 
 export type TickEvent =
-  | { type: 'gates'; allowed: boolean; blockers: string[] }
+  | { type: 'gates'; allowed: boolean; blockers: string[]; forced?: boolean }
   | { type: 'router'; result: RouterRefreshResult }
   | { type: 'dataset'; summary: string[] }
   | { type: 'job'; job: TrainJob }
@@ -262,7 +304,13 @@ export async function trainTick(cfg: ProtoConfig, dataDir: string, opts: TickOpt
   // ---- collect state for the gates ----
   const system = await readSystemState(now);
   const minutesToday = minutesUsedToday(state, now);
-  const datasets = buildDatasets(store, cfg, { write: false });
+  // The training caps, not the `datasets build` inspection defaults: this is the
+  // dataset the model will actually learn from, so it should not be truncated.
+  const datasets = buildDatasets(store, cfg, {
+    write: false,
+    maxSft: cfg.train.maxSftSamples,
+    maxDpo: cfg.train.maxDpoSamples,
+  });
   const newEpisodes = countNewEpisodes(dataDir, state);
 
   const gates = evaluateGates({
@@ -272,7 +320,14 @@ export async function trainTick(cfg: ProtoConfig, dataDir: string, opts: TickOpt
     minutesUsedToday: minutesToday,
     hasTrainingData: datasets.sft.samples.length > 0 || datasets.dpo.samples.length > 0,
   });
-  onEvent({ type: 'gates', allowed: gates.allowed, blockers: gates.blockers });
+  // Report the gates as *effective*: with --force they are advisory, and printing
+  // "blocked" next to a job that then ran is actively confusing.
+  onEvent({
+    type: 'gates',
+    allowed: gates.allowed,
+    blockers: gates.blockers,
+    forced: Boolean(opts.force) && !gates.allowed,
+  });
 
   const pf = await preflight(dataDir);
 
@@ -302,9 +357,15 @@ export async function trainTick(cfg: ProtoConfig, dataDir: string, opts: TickOpt
   }
 
   // ---- build the concrete job ----
-  const plan = planSession(cfg, minutesToday, opts.mode ?? cfg.train.lora.mode);
-  const datasetPath = plan.mode === 'dpo' ? datasets.dpo.path : datasets.sft.path;
-  const sampleCount = plan.mode === 'dpo' ? datasets.dpo.samples.length : datasets.sft.samples.length;
+  const requestedMode = opts.mode ?? cfg.train.lora.mode;
+  const sampleCount = trainingRowCount(datasets, requestedMode);
+  const plan = planSession(
+    cfg,
+    minutesToday,
+    requestedMode,
+    sampleCount,
+    measuredSecondsPerStep(cfg, new JobQueue(dataDir)),
+  );
 
   if (sampleCount === 0) {
     const fallbackMode = plan.mode === 'sft' ? 'dpo' : 'sft';
@@ -316,13 +377,20 @@ export async function trainTick(cfg: ProtoConfig, dataDir: string, opts: TickOpt
       );
     }
     onEvent({ type: 'progress', message: `no ${plan.mode.toUpperCase()} samples; using ${fallbackMode.toUpperCase()} (${fallbackCount} rows)` });
-    return startJob(fallbackMode as 'sft' | 'dpo', fallbackMode === 'dpo' ? datasets.dpo.path : datasets.sft.path, fallbackCount);
+    const fallbackPlan = planSession(
+      cfg,
+      minutesToday,
+      fallbackMode as 'sft' | 'dpo',
+      fallbackCount,
+      measuredSecondsPerStep(cfg, new JobQueue(dataDir)),
+    );
+    return startJob(fallbackMode as 'sft' | 'dpo', fallbackPlan, fallbackCount);
   }
 
-  return startJob(plan.mode, datasetPath, sampleCount);
+  return startJob(plan.mode, plan, sampleCount);
 
   // ----------------------------------------------------------------
-  async function startJob(mode: 'sft' | 'dpo', dataPath: string, rows: number): Promise<TickResult> {
+  async function startJob(mode: 'sft' | 'dpo', sessionPlan: SessionPlan, rows: number): Promise<TickResult> {
     const queue = new JobQueue(dataDir);
     const adapterPath = newAdapterPath(dataDir, mode);
     const jobId = `job-${now.getTime().toString(36)}-${mode}`;
@@ -333,9 +401,11 @@ export async function trainTick(cfg: ProtoConfig, dataDir: string, opts: TickOpt
       id: jobId,
       kind: mode,
       status: 'planned',
-      plan: { ...plan, mode },
+      plan: { ...sessionPlan, mode },
       note: opts.force ? 'forced by user' : 'scheduled tick',
-      datasetPath: dataPath,
+      // The rows this job trains on live in its own data directory; there is no
+      // intermediate file whose existence we depend on.
+      datasetPath: mlxDataDir,
       mlxDataDir,
       adapterPath,
       baseModel: cfg.train.baseModel,
@@ -345,7 +415,13 @@ export async function trainTick(cfg: ProtoConfig, dataDir: string, opts: TickOpt
 
     let prepared;
     try {
-      prepared = prepareMlxDataDir({ targetDir: mlxDataDir, trainPath: dataPath, mode });
+      // Rows come straight from memory. Reading back a file we may never have
+      // written is what broke this path on a fresh install.
+      const rows = mode === 'dpo' ? datasets.dpo.samples : datasets.sft.samples;
+      prepared = prepareMlxDataDirFromSamples({
+        targetDir: mlxDataDir,
+        samples: rows.map((r) => stripMeta(r as unknown as Record<string, unknown>)),
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       queue.update(job.id, { status: 'failed', finishedAt: new Date().toISOString(), error: message });
@@ -362,9 +438,9 @@ export async function trainTick(cfg: ProtoConfig, dataDir: string, opts: TickOpt
       dataDir: prepared.dir,
       adapterPath,
       mode,
-      iters: plan.iters,
+      iters: sessionPlan.iters,
     });
-    queue.update(job.id, { command: cmd.display, logPath, datasetPath: dataPath });
+    queue.update(job.id, { command: cmd.display, logPath, datasetPath: mlxDataDir });
 
     if (opts.dryRun) {
       queue.update(job.id, { status: 'planned', note: 'dry run: command assembled but not executed' });
@@ -382,7 +458,12 @@ export async function trainTick(cfg: ProtoConfig, dataDir: string, opts: TickOpt
     }
 
     queue.update(job.id, { status: 'running', startedAt: new Date().toISOString() });
-    onEvent({ type: 'progress', message: `training ${mode} for up to ${plan.maxRuntimeMin} min: ${cmd.display}` });
+    onEvent({
+      type: 'progress',
+      message:
+        `training ${mode} for up to ${sessionPlan.maxRuntimeMin} min: ${sessionPlan.iters} step(s), ` +
+        `${sessionPlan.effectiveEpochs.toFixed(1)} epoch(s) over ${rows} row(s)`,
+    });
 
     const result = await runTraining({
       cfg,
@@ -391,8 +472,8 @@ export async function trainTick(cfg: ProtoConfig, dataDir: string, opts: TickOpt
       dataDir: prepared.dir,
       adapterPath,
       mode,
-      iters: plan.iters,
-      maxRuntimeMs: plan.maxRuntimeMin * 60_000,
+      iters: sessionPlan.iters,
+      maxRuntimeMs: sessionPlan.maxRuntimeMin * 60_000,
       maxLoadAverage: cfg.train.maxLoadAverage,
       logPath,
     });
@@ -414,7 +495,7 @@ export async function trainTick(cfg: ProtoConfig, dataDir: string, opts: TickOpt
     const losses = parseLosses(result.outputTail);
     if (result.ok) {
       writeAdapterMetrics(adapterPath, {
-        iters: plan.iters,
+        iters: sessionPlan.iters,
         mode,
         datasetRows: rows,
         jobId: job.id,
@@ -457,6 +538,20 @@ export async function trainTick(cfg: ProtoConfig, dataDir: string, opts: TickOpt
     onEvent({ type: 'done', job: updated, reason: result.ok ? 'training completed' : (updated?.error ?? 'training failed') });
     return { ran: result.ok, reason: result.ok ? 'training completed' : (updated?.error ?? 'training failed'), gates, router, job: updated, preflight: pf, installInstructions: [], datasets };
   }
+}
+
+/**
+ * Drop the `_meta` provenance key before the rows reach mlx-lm.
+ *
+ * The datasets carry `_meta` (episode id, source, reward) for auditability. mlx-lm
+ * ignores unknown keys, but stripping them keeps the training files exactly the
+ * `{"messages": [...]}` / `{"prompt", "chosen", "rejected"}` shapes documented in
+ * `docs/rl-design.md` and avoids shipping internal ids into a training run.
+ */
+function stripMeta(row: Record<string, unknown>): Record<string, unknown> {
+  const { _meta, ...rest } = row;
+  void _meta;
+  return rest;
 }
 
 function newestEpisodeId(dataDir: string): string | null {

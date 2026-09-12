@@ -226,9 +226,37 @@ export function saveConfig(config: ProtoConfig, dataDir?: string): string {
   const dir = dataDir ?? config.dataDir ?? defaultDataDir();
   const path = join(dir, 'config.json');
   ensureDir(dir);
-  const toWrite: ProtoConfig = { ...config, dataDir: '' };
-  writeJsonAtomic(path, toWrite);
+  // Persist only what differs from the defaults.
+  //
+  // Writing the whole merged config looked harmless but made the file a
+  // snapshot: `proto train enable` would freeze every default of that day, and a
+  // later improvement to a default (better batch size, higher dataset caps) would
+  // never reach anyone who had already run a command. A delta file keeps the
+  // user's explicit choices and lets improved defaults flow through, and it is
+  // far easier to read.
+  const delta = diffFromDefaults(config);
+  writeJsonAtomic(path, { version: config.version, ...delta });
   return path;
+}
+
+/** Recursively keep only the keys whose value differs from DEFAULT_CONFIG. */
+function diffFromDefaults(value: unknown, base: unknown = DEFAULT_CONFIG): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (!isPlainObject(value)) return out;
+  const defaults = isPlainObject(base) ? base : {};
+  for (const [key, v] of Object.entries(value)) {
+    if (key === 'dataDir' || key === 'version') continue; // derived / always written
+    const d = defaults[key];
+    if (isPlainObject(v) && isPlainObject(d)) {
+      const nested = diffFromDefaults(v, d);
+      if (Object.keys(nested).length > 0) out[key] = nested;
+      continue;
+    }
+    if (JSON.stringify(v) === JSON.stringify(d)) continue;
+    if (v === undefined && d === undefined) continue;
+    out[key] = v;
+  }
+  return out;
 }
 
 /* ------------------------------------------------------------------ */

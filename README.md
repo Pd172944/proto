@@ -263,16 +263,21 @@ Measured over 2,500 simulated tasks with the shipped defaults:
 | labelled local attempts | 68 | 1,647 |
 | deployed (hybrid) router AUC | 0.724 | 0.747 |
 | heuristic prior AUC | 0.676 | 0.676 |
-| SFT samples available for LoRA | 99 | 400 (capped) |
-| DPO preference pairs | 12 | 300 (capped) |
+| SFT rows available for the local model | 99 | 2,000 |
+| DPO preference pairs | 12 | 364 |
 
 Read it this way: the **router** starts adapting after roughly 100 tasks and buys a
-real but modest gain — it learns *your* task mix and your model's quirks. The
-**LoRA** half remains a nudge at any realistic volume, and the dataset caps bind
-before it becomes more than that. A wrong-but-accepted answer rate of ~3.5% is the
-honest cost of routing to a cheap model, which is why `verify.runTests` matters.
-Full analysis, including the trainer bug the curve exposed, is in
-[docs/rl-design.md](docs/rl-design.md).
+real but modest gain — it learns *your* task mix and your model's quirks. For the
+**local model itself**, SFT data accumulates steadily but preference data accrues
+about 7× more slowly, because a DPO pair needs a task local got wrong *and* the
+cloud then fixed. Softer levers that matter more than anything else: raise
+`train.maxRuntimeMin` (overnight, e.g. 480) so a session can cover multiple epochs,
+and choose a *larger local model* — going 1.5B → 7B will do more for capability
+than any amount of LoRA on a laptop's worth of data.
+
+A wrong-but-accepted answer rate of ~3.5% is the honest cost of routing to a cheap
+model, which is why `verify.runTests` matters. Full analysis, including the three
+slow-loop bugs the curve exposed, is in [docs/rl-design.md](docs/rl-design.md).
 
 ## Privacy and consent
 
@@ -368,7 +373,7 @@ src/
   contrib/        consent records, bundle construction, outbox, upload
   eval/           task corpus, routing metrics, counterfactual replay
   util/           logging, argv, text, hashing, atomic fs, process helpers
-test/             247 tests, no network, no hardware required
+test/             257 tests, no network, no hardware required
 docs/             routing.md · rl-design.md · local-models.md · privacy.md
 scripts/          bootstrap-local.sh (dry-run default) · nightly-tick.sh
 ```
@@ -448,7 +453,7 @@ held-out slice, and decontamination checks on contributed data.
 ## Development
 
 ```bash
-npm test            # 247 tests, no network or hardware required
+npm test            # 257 tests, no network or hardware required
 npm run typecheck   # requires typescript installed (devDependency, optional)
 npm run doctor
 PROTO_LOG=debug ./bin/proto run "..." --mock

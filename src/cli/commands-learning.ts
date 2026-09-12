@@ -84,9 +84,27 @@ const train: Command = {
       }
       human.push('');
       human.push(style.bold('plan'));
-      human.push(`  mode          ${status.plan.mode}, ${status.plan.iters} iteration(s), up to ${status.plan.maxRuntimeMin} min`);
+      human.push(
+        `  mode          ${status.plan.mode}, ${status.plan.iters} step(s) at batch ${ctx.cfg.train.lora.batchSize}, ` +
+          `up to ${status.plan.maxRuntimeMin} min`,
+      );
+      human.push(
+        `  data coverage ${status.plan.effectiveEpochs.toFixed(2)} epoch(s) over ${status.plan.sampleCount} training row(s)`,
+      );
       human.push(`  priority      ${status.priority.description}`);
       human.push(`  reason        ${status.plan.reason}`);
+      if (status.plan.effectiveEpochs < 1 && status.plan.sampleCount > 0) {
+        human.push('');
+        human.push(
+          style.yellow(
+            '  This run cannot cover one epoch, so it will drift the model rather than teach it.',
+          ),
+        );
+        human.push(
+          '  Raise `train.maxRuntimeMin` (e.g. 480 for overnight), raise `train.dailyBudgetMin`, or collect more of the ' +
+            'recurring task shapes you want it to learn.',
+        );
+      }
       human.push('');
       human.push(style.bold('data available'));
       for (const line of status.datasetSummary) human.push(`  ${line}`);
@@ -132,13 +150,22 @@ const train: Command = {
               );
               break;
             case 'gates':
-              events.push(e.allowed ? 'gates: all passed' : `gates: blocked (${e.blockers.join('; ')})`);
+              events.push(
+                e.allowed
+                  ? 'gates: all passed'
+                  : e.forced
+                    ? `gates: bypassed with --force (${e.blockers.join('; ')})`
+                    : `gates: blocked (${e.blockers.join('; ')})`,
+              );
               break;
             case 'progress':
               events.push(e.message);
               break;
             case 'job':
-              events.push(`job ${e.job.id} queued (${e.job.kind}, ${e.job.plan.iters} iters)`);
+              events.push(
+                `job ${e.job.id} queued (${e.job.kind}, ${e.job.plan.iters} steps, ` +
+                  `${e.job.plan.effectiveEpochs.toFixed(2)} epoch(s) over ${e.job.plan.sampleCount} rows)`,
+              );
               break;
             default:
               break;

@@ -196,6 +196,18 @@ explanations.
 
 ## 6. Dataset shapes, dedup and caps
 
+There are two independent sets of caps, and conflating them was a bug:
+
+| Purpose | Where | Default |
+| --- | --- | --- |
+| Inspection sample for a human to read | `datasets build --max-sft/--max-dpo` | 400 / 300 |
+| What the model actually trains on | `train.maxSftSamples` / `train.maxDpoSamples` | 2000 / 1000 |
+
+Training used to inherit the inspection defaults, so it silently discarded
+everything past 400 rows even when the user had thousands. Discarding rows buys
+nothing: the wall-clock budget, the watchdog and `train.lora.maxIters` are what
+bound a session.
+
 ```jsonc
 // datasets/sft.jsonl  (mlx-lm SFT; also the distillation stream)
 {"messages":[{"role":"system","content":"..."},{"role":"user","content":"..."},
@@ -428,9 +440,14 @@ Measured on an M-series laptop, default settings (`--tasks 2500`, exploration of
 | 0 | 0 | 0% | – | – | 0 | 0 | – | – | 0.676 | – |
 | 100 | 68 | 68% | 77.9% | 2.9% | 99 | 12 | 0.724 | 0.644 | 0.676 | 72.4% |
 | 250 | 168 | 67% | 74.4% | 3.6% | 247 | 37 | 0.738 | 0.632 | 0.676 | 69.4% |
-| 1000 | 650 | 65% | 76.9% | 3.1% | 400 | 145 | 0.739 | 0.589 | 0.676 | 70.1% |
-| 2000 | 1318 | 66% | 76.2% | 3.8% | 400 | 295 | 0.746 | 0.592 | 0.676 | 73.1% |
-| 2500 | 1647 | 66% | 77.1% | 3.5% | 400 | 300 | 0.747 | 0.607 | 0.676 | 73.1% |
+| 500 | 323 | 65% | 78.0% | 3.1% | 494 | 68 | 0.697 | 0.542 | 0.676 | 68.9% |
+| 1000 | 650 | 65% | 76.9% | 3.1% | 986 | 145 | 0.739 | 0.589 | 0.676 | 70.1% |
+| 2500 | 1647 | 66% | 77.1% | 3.5% | 2000 | 364 | 0.747 | 0.607 | 0.676 | 73.1% |
+
+SFT rows are no longer capped at 400: the training caps are now separate from the
+inspection caps (see §6), so the dataset keeps growing with use. DPO reaches only
+~364 pairs at 2,500 tasks, because a preference pair requires a *failure* that the
+cloud then rescued.
 
 ### How to read that honestly
 
@@ -448,26 +465,57 @@ Measured on an M-series laptop, default settings (`--tasks 2500`, exploration of
    73.1%). It is a few points better than the prior at 100 tasks and roughly equal
    thereafter. The measurable win from the fast loop is *adaptation to your task
    mix*, not a dramatic accuracy jump.
-4. **The dataset caps bind before the learning is interesting.** SFT saturates at
-   its 400-sample cap by ~500 tasks and DPO at 300 by ~2,500. If you want the slow
-   loop to matter, raise `--max-sft` / `--max-dpo` on `datasets build` and raise
-   `train.lora.iters`; the shipped defaults are sized for a laptop nudge, not a
-   real fine-tune.
+4. **The slow loop is data-starved by the *task mix*, not by a cap.** SFT grows
+   steadily (2,000 rows by ~2,500 tasks), but a DPO pair needs a task the local
+   model got wrong *and* that the cloud then solved, so preference data accrues
+   roughly 7x more slowly — ~364 pairs at 2,500 tasks. Preference tuning wants
+   several hundred consistent pairs at minimum, so DPO is the signal to watch, not
+   SFT. If you want faster preference data, the lever is deliberate data
+   generation: let the cloud answer tasks you would otherwise have solved locally,
+   purely to manufacture pairs (see §12).
 5. **The verifier's error rate is the cost of the whole design.** ~3.5% of local
    attempts were wrong *and accepted*. That number is the reason
    `routing.qualityFloorUnverified` is 0.90 and the reason to enable
    `verify.runTests` on code you care about.
 
-### A bug this found
+6. **Steps, not rows, decide whether fine-tuning can learn.** The plan reports
+   `effectiveEpochs`: at the default 3-epoch target, 2,000 SFT rows means 1,500
+   steps at batch 4. The scheduler computes that from the row count and caps it
+   against the wall-clock budget, and it *measures* seconds-per-step from previous
+   jobs rather than guessing. When the budget cannot cover one epoch,
+   `proto train status` says so in plain language instead of quietly running a
+   session that cannot learn.
 
-The first long-horizon run showed the learned scorer getting *worse* as the log
-grew (AUC 0.65 → 0.51 from 68 to 1,647 labels). The cause was in the trainer, not
-the simulation: per-sample SGD accumulated gradients over the whole dataset without
-normalising by its size, so the effective step size grew linearly with the number
-of episodes and training oscillated at scale. `trainLogistic` now does full-batch
-gradient descent on the *mean* weighted loss, which makes the learning rate, the
-L2 strength and the convergence behaviour independent of dataset size — and makes
-training deterministic. `test/simulate.test.ts` guards the regression.
+### What this exercise broke, and what got fixed
+
+Building the simulation and running it long-horizon exposed three real defects in
+the slow loop — all of them in the "make my local model better" path, all now
+fixed and tested:
+
+1. **Training read a file it never wrote.** The scheduler called
+   `buildDatasets(..., { write: false })` and then handed `prepareMlxDataDir` the
+   *path* of that never-written file. On a fresh install every run died with
+   "no training rows found" unless the user happened to have run
+   `proto datasets build --write` first. Rows are now serialised straight from
+   memory into the job's data directory, and `datasets build --write` is purely an
+   inspection feature.
+2. **The step count guaranteed the run could not learn.** A fixed 60 iterations at
+   batch size 1 shows the model 60 examples — 15% of a single epoch over 400 rows.
+   Steps are now derived from a target number of *epochs* over the real dataset,
+   capped by the time budget, with batch size 4 for better-conditioned updates.
+   The plan reports `effectiveEpochs` and warns when it cannot reach 1.0.
+3. **The learned scorer got worse as the log grew** (AUC 0.65 → 0.51 from 68 to
+   1,647 labels). Per-sample SGD accumulated gradients over the whole dataset
+   without normalising by its size, so the effective step size grew linearly with
+   the number of episodes and training oscillated at scale. `trainLogistic` now
+   does full-batch gradient descent on the *mean* weighted loss, which makes the
+   learning rate, the L2 strength and convergence independent of dataset size —
+   and makes training deterministic. `test/simulate.test.ts` guards it.
+
+A fourth, subtler one: `saveConfig` wrote the *entire* merged config, so running
+any command froze that day's defaults into `config.json` and later improvements —
+better batch size, higher dataset caps — never reached an existing user. It now
+writes only the delta from the defaults.
 
 ## 11. Roadmap: deliberately not implemented
 

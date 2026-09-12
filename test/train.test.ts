@@ -13,10 +13,18 @@ import { describe, it } from 'node:test';
 
 import { evaluateGates, planSession, priorityPlan } from '../src/train/scheduler.ts';
 import type { SystemState } from '../src/train/scheduler.ts';
-import { buildLoraCommand, prepareMlxDataDir, preflight, pythonCandidate, ollamaModelName, serveCommands } from '../src/train/mlx.ts';
+import {
+  buildLoraCommand,
+  prepareMlxDataDir,
+  prepareMlxDataDirFromSamples,
+  preflight,
+  pythonCandidate,
+  ollamaModelName,
+  serveCommands,
+} from '../src/train/mlx.ts';
 import { JobQueue, addMinutes, loadTrainState, minutesUsedToday, saveTrainState } from '../src/train/jobs.ts';
 import { getActiveAdapter, listAdapters, setActiveAdapter, writeAdapterMetrics, writeOllamaModelfile } from '../src/train/adapter.ts';
-import { parseLosses, refreshRouter } from '../src/train/index.ts';
+import { measuredSecondsPerStep, parseLosses, refreshRouter } from '../src/train/index.ts';
 import { EpisodeStore } from '../src/memory/store.ts';
 import { writeTextAtomic, readTextOrNull } from '../src/util/fsx.ts';
 import { makeEpisode, tempDir, testConfig } from './helpers.ts';
@@ -144,15 +152,62 @@ describe('session planning', () => {
     assert.equal(planSession(cfg, 25).maxRuntimeMin, 5);
   });
 
-  it('reduces iterations so a short window is not overshot', () => {
+  it('scales steps to the available time', () => {
     const dir = tempDir();
     const cfg = testConfig(dir, {
-      train: { ...testConfig(dir).train, maxRuntimeMin: 1, dailyBudgetMin: 1, lora: { ...testConfig(dir).train.lora, iters: 200 } },
+      train: { ...testConfig(dir).train, maxRuntimeMin: 1, dailyBudgetMin: 1 },
     });
-    const plan = planSession(cfg, 0);
-    assert.ok(plan.iters < 200, 'iterations must be scaled to the available time');
-    assert.ok(plan.iters >= 5);
-    assert.match(plan.reason, /reduced iterations/);
+    // 60 seconds at 1.5s/step allows 40 steps.
+    const plan = planSession(cfg, 0, 'sft', 2000, 1.5);
+    assert.ok(plan.iters <= 40, `time budget should cap steps, got ${plan.iters}`);
+    assert.ok(plan.iters >= 1);
+  });
+
+  it('derives steps from the dataset so the model actually sees the data', () => {
+    // The old design hard-coded 60 iterations. At batch 1 that is 60 examples —
+    // 15% of one epoch on a 400-row dataset, which cannot teach anything. Steps
+    // now come from the epoch target over the real row count.
+    const dir = tempDir();
+    const cfg = testConfig(dir, {
+      train: {
+        ...testConfig(dir).train,
+        maxRuntimeMin: 600,
+        dailyBudgetMin: 600,
+        lora: { ...testConfig(dir).train.lora, batchSize: 4, epochs: 3, maxIters: 2000 },
+      },
+    });
+    const plan = planSession(cfg, 0, 'sft', 400, 1.5);
+    // 3 epochs x 400 rows / batch 4 = 300 steps, and the time budget allows it.
+    assert.equal(plan.iters, 300);
+    assert.ok(plan.effectiveEpochs >= 2.9 && plan.effectiveEpochs <= 3.1, `got ${plan.effectiveEpochs}`);
+    assert.equal(plan.sampleCount, 400);
+    assert.match(plan.reason, /epoch/);
+  });
+
+  it('warns plainly when the budget cannot even cover one epoch', () => {
+    // The honest failure mode for laptop LoRA: minutes of compute over thousands
+    // of rows skims the data instead of learning from it.
+    const dir = tempDir();
+    const cfg = testConfig(dir, {
+      train: { ...testConfig(dir).train, maxRuntimeMin: 20, dailyBudgetMin: 20 },
+    });
+    const plan = planSession(cfg, 0, 'sft', 5000, 1.5);
+    assert.ok(plan.effectiveEpochs < 1);
+    assert.match(plan.reason, /under one epoch/);
+    assert.match(plan.reason, /Raise train.maxRuntimeMin/);
+  });
+
+  it('respects the hard step ceiling', () => {
+    const dir = tempDir();
+    const cfg = testConfig(dir, {
+      train: {
+        ...testConfig(dir).train,
+        maxRuntimeMin: 100_000,
+        dailyBudgetMin: 100_000,
+        lora: { ...testConfig(dir).train.lora, epochs: 50, maxIters: 500, batchSize: 1 },
+      },
+    });
+    assert.equal(planSession(cfg, 0, 'sft', 10_000, 0.5).iters, 500);
   });
 
   it('runs at the lowest reasonable priority on macOS', () => {
@@ -169,7 +224,7 @@ describe('mlx driver', () => {
       train: {
         ...testConfig(dir).train,
         baseModel: 'mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit',
-        lora: { layers: 8, rank: 8, scale: 16, dropout: 0.05, learningRate: 1e-5, batchSize: 1, iters: 60, maxSeqLen: 1024, mode: 'sft' },
+        lora: { layers: 8, rank: 8, scale: 16, dropout: 0.05, learningRate: 1e-5, batchSize: 4, epochs: 3, maxIters: 2000, maxSeqLen: 1024, mode: 'sft' },
       },
     });
     const cmd = buildLoraCommand({
@@ -274,7 +329,7 @@ describe('job queue and state', () => {
     const job = q.add({
       kind: 'sft',
       status: 'planned',
-      plan: { maxRuntimeMin: 10, iters: 20, mode: 'sft', reason: 'test' },
+      plan: { maxRuntimeMin: 10, iters: 20, sampleCount: 80, effectiveEpochs: 1, mode: 'sft', reason: 'test' },
       note: 'test',
       datasetPath: '/tmp/sft.jsonl',
       mlxDataDir: '/tmp/data',
@@ -303,6 +358,95 @@ describe('job queue and state', () => {
     const reloaded = loadTrainState(dir);
     assert.equal(reloaded.minutesByDay['2025-06-01'], 12.5);
     assert.equal(reloaded.totalMinutes, 12.5);
+  });
+});
+
+describe('training data preparation', () => {
+  it('writes rows straight from memory, with a validation split', () => {
+    // Regression guard for the bug that made local fine-tuning impossible on a
+    // fresh install: the scheduler read a dataset file it had never written.
+    const dir = tempDir();
+    const samples = Array.from({ length: 50 }, (_, i) => ({ messages: [{ role: 'user', content: `q${i}` }] }));
+    const prepared = prepareMlxDataDirFromSamples({ targetDir: `${dir}/mlx`, samples });
+
+    assert.equal(prepared.trainRows + prepared.validRows, 50);
+    assert.ok(prepared.validRows > 0, 'a validation split is needed to know whether training helped');
+    const train = readTextOrNull(`${dir}/mlx/train.jsonl`) ?? '';
+    const valid = readTextOrNull(`${dir}/mlx/valid.jsonl`) ?? '';
+    assert.equal(train.trim().split('\n').length, prepared.trainRows);
+    assert.equal(valid.trim().split('\n').length, prepared.validRows);
+    assert.ok(!train.includes('_meta'), 'internal provenance keys must not reach the trainer');
+  });
+
+  it('trains on everything when there are too few rows to split', () => {
+    const dir = tempDir();
+    const prepared = prepareMlxDataDirFromSamples({
+      targetDir: `${dir}/mlx`,
+      samples: [{ messages: [] }, { messages: [] }],
+    });
+    assert.equal(prepared.trainRows, 2);
+    assert.equal(prepared.validRows, 2);
+  });
+
+  it('refuses an empty sample set instead of writing a file the trainer cannot use', () => {
+    const dir = tempDir();
+    assert.throws(
+      () => prepareMlxDataDirFromSamples({ targetDir: `${dir}/mlx`, samples: [] }),
+      /no training rows/,
+    );
+  });
+});
+
+describe('measured step cost', () => {
+  it('falls back to the configured estimate before any history exists', () => {
+    const dir = tempDir();
+    const cfg = testConfig(dir, { train: { ...testConfig(dir).train, secondsPerStep: 2.5 } });
+    assert.equal(measuredSecondsPerStep(cfg, new JobQueue(dir)), 2.5);
+  });
+
+  it('uses the median of what actually happened once jobs have run', () => {
+    // A guessed constant decides how many steps fit in the night, so guessing
+    // forever would make every session plan fictional.
+    const dir = tempDir();
+    const q = new JobQueue(dir);
+    const plan = { maxRuntimeMin: 10, iters: 100, sampleCount: 400, effectiveEpochs: 1, mode: 'sft' as const, reason: '' };
+    for (const durationMs of [100_000, 200_000, 300_000]) {
+      const job = q.add({
+        kind: 'sft',
+        status: 'done',
+        plan,
+        note: 'test',
+        datasetPath: '/tmp/d',
+        mlxDataDir: '/tmp/m',
+        adapterPath: '/tmp/a',
+        baseModel: 'base',
+        durationMs,
+      });
+      q.update(job.id, { durationMs });
+    }
+    const cfg = testConfig(dir, { train: { ...testConfig(dir).train, secondsPerStep: 99 } });
+    // 100s, 200s, 300s over 100 steps => 1, 2, 3 s/step; median 2.
+    assert.equal(measuredSecondsPerStep(cfg, new JobQueue(dir)), 2);
+  });
+
+  it('ignores failed and implausibly short jobs', () => {
+    const dir = tempDir();
+    const q = new JobQueue(dir);
+    const plan = { maxRuntimeMin: 10, iters: 100, sampleCount: 10, effectiveEpochs: 1, mode: 'sft' as const, reason: '' };
+    const failed = q.add({
+      kind: 'sft',
+      status: 'done',
+      plan,
+      note: '',
+      datasetPath: '',
+      mlxDataDir: '',
+      adapterPath: '',
+      baseModel: '',
+      durationMs: 10,
+    });
+    q.update(failed.id, { status: 'failed', durationMs: 10 });
+    const cfg = testConfig(dir, { train: { ...testConfig(dir).train, secondsPerStep: 4 } });
+    assert.equal(measuredSecondsPerStep(cfg, new JobQueue(dir)), 4);
   });
 });
 

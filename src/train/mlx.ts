@@ -268,7 +268,49 @@ export function newAdapterPath(dataDir: string, mode: 'sft' | 'dpo'): string {
   return join(adaptersDir(dataDir), `${mode}-${shortId()}`);
 }
 
-/** Prepare the `--data` directory mlx-lm expects (train.jsonl / valid.jsonl). */
+/**
+ * Serialise training rows straight into the `--data` directory mlx-lm expects.
+ *
+ * This is the path the scheduler uses, and it exists because of a real bug: the
+ * scheduler used to call `buildDatasets(..., { write: false })` and then hand
+ * `prepareMlxDataDir` the *path* of a file that had therefore never been written.
+ * Unless the user happened to have run `proto datasets build --write` first, every
+ * training run failed with "no training rows found" — which meant the entire
+ * "improve my local model" half of the project was dead on a fresh install while
+ * `datasets build --write` remained, misleadingly, an inspection feature.
+ *
+ * Taking the rows directly removes the filesystem round-trip and the ordering
+ * requirement: `datasets build --write` is now purely for humans.
+ */
+export function prepareMlxDataDirFromSamples(input: {
+  targetDir: string;
+  samples: unknown[];
+  /** Fraction of rows held out for validation. */
+  holdoutFraction?: number;
+}): { dir: string; trainRows: number; validRows: number } {
+  ensureDir(input.targetDir);
+  const rows = input.samples.filter((s) => s !== null && s !== undefined);
+  if (rows.length === 0) {
+    throw new Error('no training rows to write');
+  }
+
+  const holdout = input.holdoutFraction ?? 0.1;
+  // Below ~20 rows a validation split is noise rather than signal; train on
+  // everything and let mlx-lm report training loss only.
+  const holdoutCount = rows.length >= 20 ? Math.max(1, Math.floor(rows.length * holdout)) : 0;
+  const trainRows = holdoutCount > 0 ? rows.slice(0, rows.length - holdoutCount) : rows;
+  const validRows = holdoutCount > 0 ? rows.slice(rows.length - holdoutCount) : rows;
+
+  writeJsonl(input.targetDir, 'train.jsonl', trainRows);
+  writeJsonl(input.targetDir, 'valid.jsonl', validRows);
+  return { dir: input.targetDir, trainRows: trainRows.length, validRows: validRows.length };
+}
+
+function writeJsonl(dir: string, name: string, rows: unknown[]): void {
+  writeTextAtomic(join(dir, name), rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+}
+
+/** Prepare the `--data` directory mlx-lm expects from an existing file. */
 export function prepareMlxDataDir(input: {
   targetDir: string;
   trainPath: string;

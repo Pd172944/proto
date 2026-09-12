@@ -189,13 +189,39 @@ describe('config', () => {
     assert.ok(priceFor(cfg, 'claude-sonnet-4-5-20260101').in <= 5);
   });
 
-  it('round-trips through disk and clears the dataDir field', () => {
+  it('persists only what differs from the defaults', () => {
+    // Writing the whole merged config made the file a snapshot: `proto train
+    // enable` froze every default of that day, so later improvements to a default
+    // (better batch size, higher dataset caps) never reached an existing user.
+    // Separate directories, because each saveConfig replaces the whole file with
+    // the delta of the config it was handed.
+    const dirA = tempDir();
+    const cfgA = testConfig(dirA);
+    const path = saveConfig({ ...cfgA, train: { ...cfgA.train, enabled: true } }, dirA);
+    assert.deepEqual(readJsonOrNull<Record<string, unknown>>(path), { version: 1, train: { enabled: true } });
+
+    // A nested override keeps only the changed leaf.
+    const dirB = tempDir();
+    const cfgB = testConfig(dirB);
+    const path2 = saveConfig({ ...cfgB, routing: { ...cfgB.routing, qualityFloor: 0.8 } }, dirB);
+    assert.deepEqual(readJsonOrNull<Record<string, unknown>>(path2), { version: 1, routing: { qualityFloor: 0.8 } });
+
+    // And the effective config is still complete when read back.
+    const reloaded = loadConfig({ dataDir: dirA }).config;
+    assert.equal(reloaded.train.enabled, true);
+    assert.equal(reloaded.local.model, cfgA.local.model);
+    const reloadedB = loadConfig({ dataDir: dirB }).config;
+    assert.equal(reloadedB.routing.qualityFloor, 0.8);
+    assert.equal(reloadedB.local.model, cfgB.local.model);
+  });
+
+  it('round-trips through disk and never stores the derived dataDir', () => {
     const dir = tempDir();
     const cfg = testConfig(dir);
     const path = saveConfig({ ...cfg, routing: { ...cfg.routing, qualityFloor: 0.8 } }, dir);
-    const reloaded = readJsonOrNull<{ routing: { qualityFloor: number }; dataDir: string }>(path);
+    const reloaded = readJsonOrNull<{ routing: { qualityFloor: number }; dataDir?: string }>(path);
     assert.equal(reloaded?.routing.qualityFloor, 0.8);
-    assert.equal(reloaded?.dataDir, '', 'dataDir is derived, not stored');
+    assert.equal(reloaded?.dataDir, undefined, 'dataDir is derived from PROTO_HOME, never stored');
   });
 
   it('reads a key from the secrets file when the environment has none', () => {

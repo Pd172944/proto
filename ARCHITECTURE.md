@@ -224,7 +224,7 @@ detail string for both outcomes; `proto train status` prints them verbatim.
 
 ## 8. Testing strategy
 
-`npm test` runs 247 tests in ~1.5 s with no network, no hardware, and no local
+`npm test` runs 257 tests in ~1.5 s with no network, no hardware, and no local
 runtime. Test files mirror modules:
 
 | File | Protects |
