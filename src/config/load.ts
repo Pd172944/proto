@@ -190,10 +190,70 @@ export function loadConfig(opts: { dataDir?: string; overrides?: Partial<ProtoCo
   // working directory instead. This ordering bug meant that setting only an API
   // key never enabled the cloud tier.
   cfg.dataDir = dataDir;
+  const providerWasExplicit = Boolean(
+    (onDisk as { cloud?: { provider?: string } } | null)?.cloud?.provider ??
+      (opts.overrides as { cloud?: { provider?: string } } | undefined)?.cloud?.provider,
+  );
   cfg = applyEnvOverrides(cfg);
+
+  // If the configured provider has no key but a *different* known provider does,
+  // use that one. Being literal here is actively unhelpful: a user who exports
+  // ANTHROPIC_API_KEY should not have to also discover that the default provider is
+  // OpenRouter and change it. The switch is always reported, never silent.
+  const auto = autoSelectCloudProvider(cfg, dataDir, providerWasExplicit);
+  cfg = auto.config;
+  if (auto.note) warnings.push(auto.note);
 
   validate(cfg, warnings);
   return { config: cfg, dataDir, configPath, warnings };
+}
+
+/**
+ * Pick the cloud provider that can actually authenticate.
+ *
+ * Returns the config unchanged when the configured provider already has a key, or
+ * when nothing has a key (in which case the user simply has not set one up yet and
+ * we should not invent a provider).
+ */
+export function autoSelectCloudProvider(
+  cfg: ProtoConfig,
+  dataDir: string,
+  providerWasExplicit: boolean,
+): { config: ProtoConfig; note?: string } {
+  if (resolveApiKeyFor(cfg, dataDir)) return { config: cfg };
+
+  const alternatives = PROVIDER_PROFILES.filter((profile) => {
+    if (profile.id === cfg.cloud.provider) return false;
+    if (profile.id === 'custom') return false;
+    return Boolean(resolveKeyForProvider(profile.id, cfg, dataDir));
+  });
+  const chosen = alternatives[0];
+  if (!chosen) return { config: cfg };
+
+  // Name the place the key actually came from, so the message is not misleading
+  // when it was stored in the secrets file rather than exported.
+  const keyName =
+    chosen.keyEnv.find((name) => Boolean(process.env[name]?.trim())) ?? `secrets.json["${chosen.id}"]`;
+  const next: ProtoConfig = structuredClone(cfg);
+  next.cloud.provider = chosen.id;
+  // Keep the configured model only if it plausibly belongs to the new provider
+  // (an OpenRouter-style "anthropic/claude-…" id is not valid on api.anthropic.com).
+  const modelLooksValid = chosen.api === 'anthropic' ? /^claude/i.test(next.cloud.model) : true;
+  if (!modelLooksValid) next.cloud.model = chosen.defaultModel;
+  if (next.cloud.cheapModel && chosen.api === 'anthropic' && !/^claude/i.test(next.cloud.cheapModel)) {
+    next.cloud.cheapModel = chosen.cheapModel;
+  }
+  next.cloud.enabled = true;
+
+  const others = alternatives.slice(1).map((a) => a.id);
+  const note =
+    `cloud.provider was "${cfg.cloud.provider}" (no ${(providerProfile(cfg.cloud.provider)?.keyEnv[0] ?? 'key')} found), ` +
+    `so "${chosen.id}" is being used because ${keyName} is set` +
+    (others.length > 0 ? ` (also available: ${others.join(', ')})` : '') +
+    (providerWasExplicit
+      ? `. You had pinned cloud.provider explicitly — run \`proto config set cloud.provider ${cfg.cloud.provider}\` to insist on it.`
+      : `. Pin it with \`proto config set cloud.provider ${chosen.id}\` to make this permanent.`);
+  return { config: next, note };
 }
 
 function validate(cfg: ProtoConfig, warnings: string[]): void {
@@ -271,7 +331,20 @@ function diffFromDefaults(value: unknown, base: unknown = DEFAULT_CONFIG): Recor
  * and never included in episodes.
  */
 export function resolveApiKeyFor(cfg: ProtoConfig, dataDir?: string): string | undefined {
-  const profile = providerProfile(cfg.cloud.provider);
+  return resolveKeyForProvider(cfg.cloud.provider, cfg, dataDir);
+}
+
+/**
+ * Resolve a key for *any* provider id, not just the configured one.
+ *
+ * Needed by auto-selection: when the configured provider has no key we have to ask
+ * the same question of every other provider, and that question must consider the
+ * secrets file as well as the environment. Checking only env vars meant a key
+ * stored with `proto config set-key anthropic <key>` was invisible to selection and
+ * the user was still told nothing was configured.
+ */
+export function resolveKeyForProvider(providerId: string, cfg: ProtoConfig, dataDir?: string): string | undefined {
+  const profile = providerProfile(providerId);
   const envNames = profile ? [...profile.keyEnv] : ['PROTO_API_KEY'];
   if (!envNames.includes('PROTO_API_KEY')) envNames.push('PROTO_API_KEY');
   for (const name of envNames) {
@@ -281,10 +354,10 @@ export function resolveApiKeyFor(cfg: ProtoConfig, dataDir?: string): string | u
   // Note `||`, not `??`: an empty string is a *set* value to `??`, which would
   // resolve `join('', 'secrets.json')` relative to the cwd and silently miss the
   // real file.
-  const dir = (dataDir?.trim() || cfg.dataDir?.trim() || defaultDataDir());
+  const dir = dataDir?.trim() || cfg.dataDir?.trim() || defaultDataDir();
   const secrets = readJsonOrNull<Record<string, string>>(join(dir, 'secrets.json'));
   if (secrets) {
-    for (const name of [cfg.cloud.provider, ...envNames, 'default']) {
+    for (const name of [providerId, ...envNames, 'default']) {
       const v = secrets[name];
       if (v && v.trim()) return v.trim();
     }

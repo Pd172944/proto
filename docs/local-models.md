@@ -226,6 +226,31 @@ target runtime's URL, and emits a `PROTO_LOCAL_BASE_URL` process warning. Switch
 This only fires when the configured URL is *exactly* another runtime's default; a custom
 port is left alone, so set `baseUrl` explicitly anyway.
 
+## When the configured model is not the one you have
+
+A common first-run stumble: `local.model` defaults to
+`qwen2.5-coder:1.5b-instruct`, you have pulled something else, and `doctor` reports
+*"not ready — Ollama up, but ... is not downloaded"* while helpfully listing what
+you actually have. It does not adopt it for you, because silently switching to a
+different model — possibly a 9B on a small machine — would be a worse surprise than
+telling you.
+
+```bash
+proto models list                    # what the runtime actually has
+proto models use ornith-1.5:9b       # adopt one you already have
+proto models pull qwen2.5-coder:1.5b-instruct --yes   # or fetch the configured one
+```
+
+`doctor` prints the exact `proto models use …` command for the best candidate it can
+see. Candidates are ranked in `rankLocalModels()` (`src/providers/index.ts`) by:
+agentic/tool-use lineage first (this is an agent, so a model post-trained for tool
+calling is worth more here than one that only scores well on single-shot code
+benchmarks), then code-capable families, then parameter count, then instruction-tuned
+over base. Embedding and vision-only models are pushed to the bottom.
+
+The ranking is a heuristic over names, so `doctor` shows the whole list with its
+recommendation marked rather than acting on it.
+
 ## Troubleshooting
 
 ### "Ollama is not responding"

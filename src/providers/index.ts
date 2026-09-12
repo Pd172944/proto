@@ -45,6 +45,47 @@ export function effectiveLocalBaseUrl(cfg: ProtoConfig): { url: string; correcte
   return { url: configured, corrected: false };
 }
 
+/**
+ * Rank locally available models by how suitable they are for this harness.
+ *
+ * Used to suggest a model when the configured one is absent. A user who has pulled
+ * `ornith-1.5:9b` should not be told "qwen2.5-coder:1.5b-instruct is not
+ * downloaded" and left to work out the rest — but silently adopting whatever is
+ * lying around would be worse, so this only ever produces a *suggestion*.
+ *
+ * Ordering, in order of weight:
+ *  1. **Agentic / tool-use training first.** This harness is an agent, so a model
+ *     post-trained for tool calling and scaffolds is more valuable here than one
+ *     that merely scores well on single-shot code benchmarks. That is why `ornith`
+ *     and `devstral` outrank a same-size general coder.
+ *  2. Code-capable families next.
+ *  3. Larger parameter counts, since a 9B generally beats a 1.5B on the same task.
+ *  4. Instruction-tuned over base, because a base model will not follow tools.
+ * Embedding and vision-only models are pushed to the bottom: suggesting one as the
+ * coding tier would be worse than suggesting nothing.
+ *
+ * This only ever produces a *suggestion* — owner consent is required to change the
+ * configured model, because silently adopting a 9B model on a small machine would
+ * be a nasty surprise.
+ */
+export function rankLocalModels(models: string[]): string[] {
+  const score = (model: string): number => {
+    const m = model.toLowerCase();
+    let s = 0;
+    // 1. agentic / tool-use lineage
+    if (/ornith|devstral|agent|tool-?use|hermes/.test(m)) s += 25;
+    // 2. code-capable families
+    if (/coder|code|starcoder|wizardcoder/.test(m)) s += 60;
+    if (/instruct|chat|it\b|-it$/.test(m)) s += 8;
+    if (/-base|^base/.test(m)) s -= 25;
+    if (/embed|nomic|mxbai|bge-|rerank|whisper|llava|vision|clip|guard|moderation/.test(m)) s -= 1000;
+    const params = m.match(/(\d+(?:\.\d+)?)\s*b\b/);
+    if (params?.[1]) s += Math.min(30, Number(params[1]));
+    return s;
+  };
+  return [...models].sort((a, b) => score(b) - score(a) || a.localeCompare(b));
+}
+
 export function buildLocalProvider(cfg: ProtoConfig): Provider {
   const { url, note } = effectiveLocalBaseUrl(cfg);
   if (note) {

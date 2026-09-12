@@ -276,6 +276,8 @@ style, and it is cheaper and more reliable than putting it in every message.
 | Every write is "denied" | you are piping output, not in a TTY | run it in a real terminal, or pass `--yes` deliberately |
 | An edit is refused twice in a row | the model is guessing at whitespace | tell it to re-read the file; the refusal reason says so |
 | No colour | `NO_COLOR` set or not a TTY | `PROTO_COLOR=1` forces it |
+| `doctor` says the local model is not downloaded | you pulled a different model | `proto models use <name>` adopts one you already have; the runtime is never switched silently |
+| `api key missing` though you exported one | the default provider is OpenRouter, so it looks for `OPENROUTER_API_KEY` | a key for any known provider is auto-selected, and `doctor` now prints which key names it found |
 | It stops mid-task | step or time budget | raise `--max-steps` / `--deadline-min` |
 
 ---

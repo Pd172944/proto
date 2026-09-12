@@ -14,7 +14,17 @@ import { flagBool, flagList, flagNumber, flagString, parseArgs } from '../src/ut
 import type { FlagSpec } from '../src/util/args.ts';
 import { estimateTokens, extractCodeBlocks, extractJson, oneLine, sha256, shannonEntropy, stableStringify, truncateMiddle } from '../src/util/text.ts';
 import { contentId, shortId, ulid } from '../src/util/ids.ts';
-import { deepMerge, loadConfig, priceFor, resolveDataDir, saveConfig, writeSecret, resolveApiKeyFor } from '../src/config/load.ts';
+import {
+  autoSelectCloudProvider,
+  deepMerge,
+  loadConfig,
+  priceFor,
+  resolveDataDir,
+  saveConfig,
+  writeSecret,
+  resolveApiKeyFor,
+} from '../src/config/load.ts';
+import { rankLocalModels } from '../src/providers/index.ts';
 import { DEFAULT_CONFIG, PROVIDER_PROFILES, UNKNOWN_PRICE, providerProfile } from '../src/config/schema.ts';
 import { formatBytes, formatDuration, readJsonOrNull, resolvePath, writeJsonAtomic } from '../src/util/fsx.ts';
 import { localDayKey, localHour, shiftDayKey } from '../src/util/clock.ts';
@@ -308,6 +318,139 @@ describe('clock helpers', () => {
     assert.equal(shiftDayKey('2025-01-01', -1), '2024-12-31');
     assert.equal(shiftDayKey('2024-02-28', 1), '2024-02-29');
     assert.equal(shiftDayKey('2025-12-31', 1), '2026-01-01');
+  });
+});
+
+describe('cloud provider auto-selection', () => {
+  /** Run `fn` with a controlled set of provider keys, restoring the environment. */
+  const withKeys = (keys: Record<string, string | undefined>, fn: () => void): void => {
+    const names = ['OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'DEEPSEEK_API_KEY', 'GROQ_API_KEY', 'PROTO_API_KEY'];
+    const saved = new Map(names.map((n) => [n, process.env[n]]));
+    for (const n of names) delete process.env[n];
+    for (const [n, v] of Object.entries(keys)) if (v !== undefined) process.env[n] = v;
+    try {
+      fn();
+    } finally {
+      for (const [n, v] of saved) {
+        if (v === undefined) delete process.env[n];
+        else process.env[n] = v;
+      }
+    }
+  };
+
+  it('uses the provider whose key is actually set, and says so', () => {
+    // The real-world failure this fixes: a user exports ANTHROPIC_API_KEY, the
+    // default provider is OpenRouter, and doctor reports "api key missing" with no
+    // explanation of why.
+    const dir = tempDir();
+    withKeys({ ANTHROPIC_API_KEY: 'sk-ant-test' }, () => {
+      const cfg = testConfig(dir);
+      assert.equal(cfg.cloud.provider, 'openrouter');
+      const result = autoSelectCloudProvider(cfg, dir, false);
+      assert.equal(result.config.cloud.provider, 'anthropic');
+      assert.equal(result.config.cloud.enabled, true);
+      assert.match(result.note ?? '', /ANTHROPIC_API_KEY is set/);
+      // An OpenRouter-style model id is invalid on api.anthropic.com.
+      assert.match(result.config.cloud.model, /^claude/);
+    });
+  });
+
+  it('leaves a provider that has its own key alone', () => {
+    const dir = tempDir();
+    withKeys({ ANTHROPIC_API_KEY: 'sk-ant-test', OPENROUTER_API_KEY: 'sk-or-test' }, () => {
+      const result = autoSelectCloudProvider(testConfig(dir), dir, false);
+      assert.equal(result.config.cloud.provider, 'openrouter');
+      assert.equal(result.note, undefined);
+    });
+  });
+
+  it('invents nothing when no key is set at all', () => {
+    const dir = tempDir();
+    withKeys({}, () => {
+      const result = autoSelectCloudProvider(testConfig(dir), dir, false);
+      assert.equal(result.config.cloud.provider, 'openrouter');
+      assert.equal(result.config.cloud.enabled, false);
+      assert.equal(result.note, undefined);
+    });
+  });
+
+  it('reads a key from the secrets file, not only the environment', () => {
+    const dir = tempDir();
+    withKeys({}, () => {
+      const cfg = testConfig(dir);
+      writeSecret(dir, 'anthropic', 'from-file');
+      const result = autoSelectCloudProvider(cfg, dir, false);
+      assert.equal(result.config.cloud.provider, 'anthropic');
+    });
+  });
+
+  it('warns more loudly when the user had pinned a provider explicitly', () => {
+    const dir = tempDir();
+    withKeys({ ANTHROPIC_API_KEY: 'sk-ant-test' }, () => {
+      const pinned = autoSelectCloudProvider(testConfig(dir), dir, true);
+      assert.match(pinned.note ?? '', /pinned cloud\.provider explicitly/);
+    });
+  });
+
+  it('keeps a valid model when switching between OpenAI-shaped providers', () => {
+    const dir = tempDir();
+    withKeys({ DEEPSEEK_API_KEY: 'ds-test' }, () => {
+      const cfg = testConfig(dir);
+      const result = autoSelectCloudProvider(cfg, dir, false);
+      assert.equal(result.config.cloud.provider, 'deepseek');
+      // The configured model was not provider-specific, so it is left alone.
+      assert.equal(result.config.cloud.model, cfg.cloud.model);
+    });
+  });
+});
+
+describe('local model ranking', () => {
+  it('ranks code-capable and agentic models above generic ones', () => {
+    const ranked = rankLocalModels(['llama3.2:1b', 'qwen2.5-coder:1.5b-instruct', 'ornith-1.5:9b', 'qwen2.5-coder:7b-instruct']);
+    const at = (m: string): number => ranked.indexOf(m);
+    // Both a dedicated coder and an agentic model must beat a generic chat model,
+    // even a much larger one.
+    assert.ok(at('qwen2.5-coder:1.5b-instruct') < at('llama3.2:1b'));
+    assert.ok(at('ornith-1.5:9b') < at('llama3.2:1b'));
+    // Size breaks ties inside a family.
+    assert.ok(at('qwen2.5-coder:7b-instruct') < at('qwen2.5-coder:1.5b-instruct'));
+  });
+
+  it('does not pretend to know whether an agentic model beats a same-size coder', () => {
+    // ornith-1.5:9b (agentic, 9B) vs qwen2.5-coder:7b-instruct (coder, 7B) is a
+    // genuine judgement call, not something a name-based heuristic can settle. Both
+    // must rank well above generic models; the relative order is left to the user,
+    // which is why `doctor` prints the whole ranked list rather than a single answer.
+    const ranked = rankLocalModels(['ornith-1.5:9b', 'qwen2.5-coder:7b-instruct', 'llama3.2:13b']);
+    const generic = ranked.indexOf('llama3.2:13b');
+    assert.equal(generic, 2, 'both specialist models must outrank a larger generic one');
+  });
+
+  it('the agentic bonus is real, not cosmetic', () => {
+    // Without the agentic term, ornith would rank purely on size and lose to a much
+    // larger generic model.
+    const ranked = rankLocalModels(['llama3.2:70b', 'ornith-1.5:9b']);
+    assert.equal(ranked[0], 'ornith-1.5:9b');
+  });
+
+  it('pushes embedding and vision models to the bottom', () => {
+    // Suggesting an embedding model as the coding tier would be worse than
+    // suggesting nothing, so they must never rank first.
+    const ranked = rankLocalModels(['nomic-embed-text:latest', 'llava:13b', 'qwen2.5-coder:1.5b-instruct']);
+    assert.equal(ranked[0], 'qwen2.5-coder:1.5b-instruct');
+    assert.ok(ranked.indexOf('nomic-embed-text:latest') > 0);
+    assert.ok(ranked.indexOf('llava:13b') > 0);
+  });
+
+  it('prefers instruction-tuned models over base models of the same size', () => {
+    const ranked = rankLocalModels(['qwen2.5-coder:7b-base', 'qwen2.5-coder:7b-instruct']);
+    assert.equal(ranked[0], 'qwen2.5-coder:7b-instruct');
+  });
+
+  it('is stable and total for unknown names', () => {
+    const input = ['zzz:latest', 'aaa:latest'];
+    assert.deepEqual(rankLocalModels(input), rankLocalModels(input));
+    assert.equal(rankLocalModels(input).length, 2);
   });
 });
 

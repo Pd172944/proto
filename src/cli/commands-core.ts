@@ -7,7 +7,7 @@ import { join } from 'node:path';
 
 import { flagBool, flagList, flagString } from './index.ts';
 import type { Command, CommandContext, CommandResult } from './index.ts';
-import { buildProviders, buildLocalProvider, LOCAL_RUNTIME_DEFAULTS } from '../providers/index.ts';
+import { buildProviders, buildLocalProvider, rankLocalModels, LOCAL_RUNTIME_DEFAULTS } from '../providers/index.ts';
 import { MockProvider } from '../providers/mock.ts';
 import { routeTask } from '../router/index.ts';
 import { heuristicScore } from '../router/heuristic.ts';
@@ -134,10 +134,31 @@ const doctor: Command = {
     human.push(`  runtime       ${ctx.cfg.local.runtime} @ ${ctx.cfg.local.baseUrl}`);
     human.push(`  model         ${ctx.cfg.local.model}`);
     human.push(`  status        ${localHealth.ok ? style.green('ready') : style.yellow('not ready')} — ${localHealth.detail}`);
-    if (localHealth.models?.length) {
-      human.push(`  available     ${localHealth.models.slice(0, 8).join(', ')}${localHealth.models.length > 8 ? ` … (+${localHealth.models.length - 8})` : ''}`);
+
+    const available = rankLocalModels(localHealth.models ?? []);
+    if (available.length > 0) {
+      human.push(`  available     ${available.slice(0, 6).join(', ')}${available.length > 6 ? ` … (+${available.length - 6})` : ''}`);
     }
-    if (localHealth.hint) {
+
+    // The most useful thing doctor can do when the configured model is missing but
+    // other models are present: name the best candidate and the exact command.
+    if (!localHealth.ok && available.length > 0) {
+      const best = available[0] as string;
+      human.push('');
+      human.push(`  ${style.yellow('the configured model is not downloaded, but these are:')}`);
+      for (const m of available.slice(0, 5)) {
+        const mark = m === best ? style.green(' ← recommended') : '';
+        human.push(`    ${m}${mark}`);
+      }
+      human.push(`  use one with:  ${style.cyan(`proto models use ${best}`)}`);
+      human.push(`  or download the configured one:  ${style.cyan(`proto models pull ${ctx.cfg.local.model} --yes`)}`);
+      nextSteps.push(`adopt a model you already have: proto models use ${best}`);
+    }
+    if (localHealth.ok && localHealth.models && localHealth.models.length > 1) {
+      const others = available.filter((m) => !m.startsWith(ctx.cfg.local.model));
+      if (others.length > 0) human.push(`  switch with   ${style.cyan(`proto models use ${others[0]}`)}`);
+    }
+    if (localHealth.hint && !(available.length > 0 && !localHealth.ok)) {
       human.push(`  ${style.yellow('hint')}          ${localHealth.hint}`);
       nextSteps.push(localHealth.hint);
     }
@@ -153,6 +174,21 @@ const doctor: Command = {
     human.push(`  base url      ${cloudBaseUrl(ctx.cfg)}`);
     human.push(`  model         ${ctx.cfg.cloud.model}${ctx.cfg.cloud.cheapModel ? ` (cheap: ${ctx.cfg.cloud.cheapModel})` : ''}`);
     human.push(`  api key       ${keyPresent ? style.green('present') : style.yellow('missing')}`);
+
+    // When a key is missing, show which provider keys *are* set. Without this, a
+    // user with ANTHROPIC_API_KEY and the default OpenRouter provider sees only
+    // "missing" and has no idea why.
+    if (!keyPresent) {
+      const present = PROVIDER_PROFILES.filter((p) =>
+        p.keyEnv.some((name) => Boolean(process.env[name]?.trim())),
+      );
+      if (present.length > 0) {
+        human.push(`  ${style.yellow('found instead')} ${present.map((p) => `${p.keyEnv.find((n) => process.env[n]?.trim())} (${p.id})`).join(', ')}`);
+        nextSteps.push(`a key for another provider is set — pin it: proto config set cloud.provider ${present[0]?.id}`);
+      } else {
+        human.push(`  ${style.dim('looked for')}    ${(providerProfile(ctx.cfg.cloud.provider)?.keyEnv ?? []).join(', ')}`);
+      }
+    }
     human.push(`  enabled       ${ctx.cfg.cloud.enabled ? 'yes' : 'no'}`);
     report['cloud'] = {
       provider: ctx.cfg.cloud.provider,
@@ -583,8 +619,8 @@ function renderStatus(status: string): string {
 
 const models: Command = {
   name: 'models',
-  summary: 'list local models and adapters; print (never run) download commands',
-  usage: 'proto models [list|pull <name>] [--yes]',
+  summary: 'list local models and adapters; adopt one with `use`; print download commands',
+  usage: 'proto models [list|use <name>|pull <name>] [--yes]',
   flags: [
     { name: 'yes', type: 'boolean', description: 'confirm running a download command' },
     { name: 'runtime', type: 'string', description: 'override the local runtime for this listing' },
@@ -626,6 +662,32 @@ const models: Command = {
       };
     }
 
+    if (sub === 'use') {
+      const name = ctx.positionals[1];
+      if (!name) {
+        const health = await buildLocalProvider(ctx.cfg).health();
+        const ranked = rankLocalModels(health.models ?? []);
+        human.push(ranked.length > 0
+          ? `usage: proto models use <name>\n\navailable:\n${ranked.map((m) => `  ${m}`).join('\n')}`
+          : 'usage: proto models use <name>\n\n(no local models found — is the runtime running?)');
+        return { human, json: { ok: ranked.length > 0, available: ranked } };
+      }
+      const health = await buildLocalProvider(ctx.cfg).health();
+      const known = health.models ?? [];
+      const next = structuredClone(ctx.cfg);
+      next.local.model = name;
+      const saved = saveConfig(next, ctx.dataDir);
+      human.push(`local.model = ${name}`);
+      human.push(`wrote ${saved}`);
+      if (known.length > 0 && !known.some((m) => m === name || m.startsWith(`${name}:`))) {
+        human.push(style.yellow(`note: "${name}" does not look downloaded. Available: ${known.join(', ')}`));
+        human.push(`      fetch it with: proto models pull ${name} --yes`);
+      } else {
+        human.push('next: `proto code --local` or `proto run "<task>" --tier local`');
+      }
+      return { human, json: { ok: true, model: name, path: saved, available: known } };
+    }
+
     if (sub === 'pull') {
       const name = ctx.positionals[1];
       if (!name) throw new Error('usage: proto models pull <model-name>');
@@ -652,7 +714,7 @@ const models: Command = {
       return { human, json: { ok: res.code === 0, ran: true, command, code: res.code }, exitCode: res.code === 0 ? 0 : 1 };
     }
 
-    throw new Error(`unknown subcommand "${sub}". Try: proto models list | proto models pull <name>`);
+    throw new Error(`unknown subcommand "${sub}". Try: proto models list | proto models use <name> | proto models pull <name>`);
   },
 };
 
