@@ -1,6 +1,14 @@
 # proto-harness
 
-A two-regime coding harness for a single machine.
+A **coding agent** for your terminal, and the two-regime harness underneath it.
+
+```bash
+cd ~/my-project && proto code        # an agent that reads, edits and runs commands
+```
+
+Then, if you want the local/cloud economics: easy work goes to a fast model on your
+machine, hard work goes to a cloud model behind your key, and verification decides
+which was good enough.
 
 Easy coding work — fix an off-by-one, rewrite a loop, rename a symbol, change a
 prompt, add a guard clause, write a docstring — goes to a **very fast local model**
@@ -117,6 +125,38 @@ export OPENROUTER_API_KEY=...       # or ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEP
 ```
 
 ---
+
+## The agent (`proto code`)
+
+An interactive agent you run from inside a project, like `claude` or any other
+terminal coding agent. It gathers context (git state, project layout, `AGENTS.md` /
+`CLAUDE.md`), then loops: model → tool calls → results → model, until the task is
+done or it is genuinely blocked.
+
+| | |
+|---|---|
+| **Tools** | `read_file`, `list_files`, `search` (read) · `write_file`, `edit_file` (write) · `run_command` (exec) |
+| **Consent** | every write shows a real diff and every command shows the exact command line, before it runs. "Always" lasts only for the session |
+| **Edits are verified** | `edit_file` refuses a missing *or ambiguous* anchor, a change that would not parse, and introduced anti-patterns — reusing the same verifier the batch harness uses |
+| **Bounded** | step cap and wall-clock budget per turn, so it cannot loop forever on your money |
+| **Interruptible** | Ctrl-C aborts the turn, not the session |
+| **Fails closed** | a piped run denies writes unless you pass `--yes` deliberately |
+
+```bash
+proto code                              # interactive, in the current directory
+proto code --read-only                  # physically cannot write anything
+proto code --local                      # use the local model instead of the cloud
+proto code --demo                       # zero-setup: scripted provider, real loop
+proto code "explain the auth flow" --print    # one-shot, composes with pipes
+```
+
+Slash commands: `/help /model /local /cloud /workspace /tools /cost /clear /save /quit`.
+`!command` runs a shell command directly.
+
+Colour scheme is ember-and-deep-water (amber structure, teal for actionable things,
+coral only for failure), inspired by [gum](https://github.com/charmbracelet/gum)'s
+shape but not its palette. Full guide, including the baseline test procedure:
+**[docs/interactive.md](docs/interactive.md)**.
 
 ## Why this exists
 
@@ -309,6 +349,7 @@ what this design does not protect against.
 
 | Command | Purpose |
 |---|---|
+| `proto code [prompt] [--local] [--read-only] [--demo] [--print]` | **interactive coding agent** rooted at the current directory |
 | `proto doctor [--probe-cloud]` | check runtimes, providers, verifier, trainer; say exactly what is missing |
 | `proto setup [--runtime …] [--download --yes]` | print (or run) local model install instructions |
 | `proto route "<task>" [--file p]… [--explain]` | show the routing decision; no model calls |
@@ -362,7 +403,10 @@ Useful environment variables: `PROTO_HOME`, `PROTO_LOCAL_MODEL`,
 
 ```
 src/
-  cli/            command dispatch + the three command groups
+  agent/          the agent loop, session state, and prompt construction
+  tools/          the tool contract and the file/shell tools      ← edit_file is verifier-backed
+  tui/            terminal rendering: palette, boxes, diffs, markdown
+  cli/            command dispatch + the command groups
   config/         schema, defaults, provider profiles, pricing, secret resolution
   providers/      the provider contract; OpenAI-compatible, Anthropic, Ollama, mock
   router/         features → heuristic → learned scorer → policy   ← the core
@@ -373,8 +417,8 @@ src/
   contrib/        consent records, bundle construction, outbox, upload
   eval/           task corpus, routing metrics, counterfactual replay
   util/           logging, argv, text, hashing, atomic fs, process helpers
-test/             257 tests, no network, no hardware required
-docs/             routing.md · rl-design.md · local-models.md · privacy.md
+test/             345 tests, no network, no hardware required
+docs/             interactive.md · routing.md · rl-design.md · local-models.md · privacy.md
 scripts/          bootstrap-local.sh (dry-run default) · nightly-tick.sh
 ```
 
@@ -453,7 +497,7 @@ held-out slice, and decontamination checks on contributed data.
 ## Development
 
 ```bash
-npm test            # 257 tests, no network or hardware required
+npm test            # 345 tests, no network or hardware required
 npm run typecheck   # requires typescript installed (devDependency, optional)
 npm run doctor
 PROTO_LOG=debug ./bin/proto run "..." --mock

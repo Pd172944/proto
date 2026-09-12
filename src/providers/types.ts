@@ -24,6 +24,15 @@ export interface Message {
   /** Tool name for `tool` messages, or an optional speaker label. */
   name?: string;
   toolCallId?: string;
+  /**
+   * Tool calls the assistant requested in this turn.
+   *
+   * Both the Anthropic and OpenAI APIs require the assistant message to carry its
+   * own tool-call blocks, and require each subsequent tool result to reference
+   * them by id. A transcript flattened to plain text is rejected with a 400, so
+   * these are part of the wire format, not a convenience.
+   */
+  toolCalls?: ToolCall[];
   /** Mark this message as a cache boundary where the provider supports it. */
   cacheBreakpoint?: boolean;
 }
@@ -80,6 +89,12 @@ export interface ChatResponse {
   error?: string;
 }
 
+/** One incremental event from a streaming completion. */
+export type StreamEvent =
+  | { type: 'text-delta'; text: string }
+  | { type: 'tool-call'; toolCall: ToolCall }
+  | { type: 'done'; response: ChatResponse };
+
 export interface ProviderCapabilities {
   /** Supports native tool/function calling. */
   tools: boolean;
@@ -101,6 +116,17 @@ export interface Provider {
   readonly model: string;
   readonly capabilities: ProviderCapabilities;
   chat(req: ChatRequest): Promise<ChatResponse>;
+  /**
+   * Stream a completion, invoking `onEvent` as deltas arrive, and resolve with the
+   * same `ChatResponse` that `chat()` would have returned.
+   *
+   * Optional because not every runtime supports it: `OllamaProvider` does not
+   * implement it today, so callers MUST fall back to `chat()` when it is absent.
+   * The resolved response must be identical to the non-streaming result, so that
+   * streaming is a pure UX improvement and never changes behaviour, cost
+   * accounting or verification.
+   */
+  chatStream?(req: ChatRequest, onEvent: (event: StreamEvent) => void): Promise<ChatResponse>;
   /** Cheap liveness probe; used by `doctor` and by the router's tier vetoes. */
   health(): Promise<Health>;
 }

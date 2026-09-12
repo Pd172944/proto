@@ -59,6 +59,9 @@ cli  ──►  harness ──►  verify ──┐
 | `eval` | corpus, metrics, counterfactual replay | spend money or mutate state |
 | `simulate` | synthetic users, ground-truth competence, learning-curve reporting | write to the real episode log or the real weights |
 | `contrib` | consent, bundles, outbox, upload | upload without three independent opt-ins |
+| `tools` | read/search/write/edit/exec tools, approval-gated by declared risk | mutate anything without an approval, or resolve a path outside the workspace |
+| `agent` | the multi-turn agent loop, session state, prompt construction | render to a terminal, or decide policy (approval lives in the caller) |
+| `tui` | pure string rendering: palette, boxes, diffs, markdown | write to stdout, or hold any state |
 
 ### `Provider`
 
@@ -224,7 +227,7 @@ detail string for both outcomes; `proto train status` prints them verbatim.
 
 ## 8. Testing strategy
 
-`npm test` runs 257 tests in ~1.5 s with no network, no hardware, and no local
+`npm test` runs 345 tests in ~1.5 s with no network, no hardware, and no local
 runtime. Test files mirror modules:
 
 | File | Protects |

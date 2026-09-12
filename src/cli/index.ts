@@ -155,6 +155,7 @@ function printTopLevelHelp(commands: Command[], showBanner: boolean): void {
   out(`global flags: ${GLOBAL_FLAGS.map((f) => `--${f.name}`).join(', ')}`);
   out('');
   out('start here:');
+  out(`  ${style.bold('proto code')}              interactive coding agent in the current directory`);
   out('  proto doctor            check what is installed and what is missing');
   out('  proto setup             print the exact commands to download a local model (nothing runs)');
   out('  proto route "fix this off-by-one" --file src/a.py     see the routing decision');
@@ -190,12 +191,15 @@ function levenshtein(a: string, b: string): number {
 
 /** Commands are loaded lazily so `proto --help` stays instant. */
 async function loadCommands(): Promise<Command[]> {
-  const [{ coreCommands }, { memoryCommands }, { learningCommands }] = await Promise.all([
+  const [{ coreCommands }, { memoryCommands }, { learningCommands }, { codeCommand }] = await Promise.all([
     import('./commands-core.ts'),
     import('./commands-memory.ts'),
     import('./commands-learning.ts'),
+    import('./commands-code.ts'),
   ]);
-  return [...coreCommands, ...memoryCommands, ...learningCommands];
+  // `code` is listed first because for most users it is the whole product; the rest
+  // of the CLI is the research apparatus around it.
+  return [codeCommand, ...coreCommands, ...memoryCommands, ...learningCommands];
 }
 
 /* Re-exported for command modules. */

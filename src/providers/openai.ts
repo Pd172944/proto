@@ -5,8 +5,9 @@
  * Together, xAI, and the local servers (llama.cpp `llama-server`, LM Studio,
  * vLLM, `mlx_lm.server`). They all speak `POST {base}/chat/completions`.
  *
- * Deliberate omissions: streaming (we need the whole candidate before
- * verification anyway) and multi-modal content (this is a coding harness).
+ * Deliberate omissions: multi-modal content (this is a coding harness).
+ * `chatStream()` exists as a pure UX improvement over `chat()`; verification
+ * still consumes only the fully-formed `ChatResponse`.
  * Unsupported `jsonSchema` requests degrade to a prompt-level instruction plus
  * best-effort parsing, because not every gateway supports `response_format`.
  */
@@ -17,9 +18,11 @@ import type {
   ChatResponse,
   FinishReason,
   Health,
+  Message,
   Provider,
   ProviderCapabilities,
   ProviderKind,
+  StreamEvent,
   ToolCall,
   Usage,
 } from './types.ts';
@@ -100,22 +103,17 @@ export class OpenAICompatibleProvider implements Provider {
     return headers;
   }
 
-  async chat(req: ChatRequest): Promise<ChatResponse> {
-    if (this.requireKey && !this.apiKey) {
-      throw new ProviderError(this.id, `no API key configured for ${this.label}`, {
-        retryable: false,
-        hint: `Set ${this.label.toUpperCase().replace(/\W+/g, '_')}_API_KEY or run \`proto config set-key\`.`,
-      });
-    }
-
+  /**
+   * The chat-completions body, shared by `chat()` and `chatStream()`.
+   *
+   * Both entry points must map the transcript identically — a divergence here
+   * would make a streamed call send a different prompt (and cost) than the
+   * non-streamed one.
+   */
+  private buildBody(req: ChatRequest): Record<string, unknown> {
     const body: Record<string, unknown> = {
       model: this.model,
-      messages: req.messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-        ...(m.toolCallId ? { tool_call_id: m.toolCallId } : {}),
-        ...(m.name && m.role === 'tool' ? { name: m.name } : {}),
-      })),
+      messages: toWireMessages(req.messages),
     };
     if (req.maxTokens !== undefined) body['max_tokens'] = req.maxTokens;
     if (req.temperature !== undefined) body['temperature'] = req.temperature;
@@ -134,6 +132,18 @@ export class OpenAICompatibleProvider implements Provider {
         json_schema: { name: 'proto_output', strict: false, schema: req.jsonSchema },
       };
     }
+    return body;
+  }
+
+  async chat(req: ChatRequest): Promise<ChatResponse> {
+    if (this.requireKey && !this.apiKey) {
+      throw new ProviderError(this.id, `no API key configured for ${this.label}`, {
+        retryable: false,
+        hint: `Set ${this.label.toUpperCase().replace(/\W+/g, '_')}_API_KEY or run \`proto config set-key\`.`,
+      });
+    }
+
+    const body = this.buildBody(req);
 
     const started = Date.now();
     let res;
@@ -167,6 +177,213 @@ export class OpenAICompatibleProvider implements Provider {
       return emptyResponse(this.id, this.model, latencyMs, 'response was not valid JSON');
     }
     return this.normalize(parsed, latencyMs, req);
+  }
+
+  /**
+   * SSE streaming for the OpenAI-compatible wire format.
+   *
+   * Unlike Anthropic there are no content blocks: each `data:` line is a full
+   * chunk, text arrives as `choices[0].delta.content`, and a tool call is
+   * fragmented across chunks as `delta.tool_calls[]` entries keyed by `index`.
+   * The `arguments` fragments are only concatenated (and therefore parseable) at
+   * the end of the stream, so calls are buffered and emitted then.
+   */
+  async chatStream(req: ChatRequest, onEvent: (event: StreamEvent) => void): Promise<ChatResponse> {
+    if (this.requireKey && !this.apiKey) {
+      throw new ProviderError(this.id, `no API key configured for ${this.label}`, {
+        retryable: false,
+        hint: `Set ${this.label.toUpperCase().replace(/\W+/g, '_')}_API_KEY or run \`proto config set-key\`.`,
+      });
+    }
+
+    const body = this.buildBody(req);
+    body['stream'] = true;
+
+    const started = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error('timeout')), this.timeoutMs);
+    const onOuterAbort = (): void => controller.abort(new Error('aborted'));
+    if (req.signal) {
+      if (req.signal.aborted) controller.abort(new Error('aborted'));
+      else req.signal.addEventListener('abort', onOuterAbort, { once: true });
+    }
+
+    try {
+      let res;
+      try {
+        // `request()` from util/http.ts calls `res.text()` before returning, so it
+        // buffers the whole body and can never deliver a delta. Streaming uses
+        // global fetch directly and reads `response.body` incrementally.
+        res = await fetch(joinUrl(this.baseUrl, 'chat/completions'), {
+          method: 'POST',
+          headers: this.headers(req),
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+      } catch (err) {
+        throw toProviderError(this.id, err, this.baseUrl);
+      }
+
+      if (!res.ok) {
+        const detail = extractError(await res.text().catch(() => ''));
+        throw new ProviderError(this.id, `${this.label} HTTP ${res.status}: ${detail}`, {
+          status: res.status,
+          retryable: res.status === 429 || res.status >= 500,
+        });
+      }
+
+      // Some local runtimes ignore `stream: true` and answer with a normal JSON
+      // completion. Detect that from the content type and normalize it as usual
+      // rather than feeding a JSON body to the SSE parser.
+      const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
+      if (!contentType.includes('text/event-stream')) {
+        const latencyMs = Date.now() - started;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(await res.text());
+        } catch {
+          return emptyResponse(this.id, this.model, latencyMs, 'response was not valid JSON');
+        }
+        const response = this.normalize(parsed, latencyMs, req);
+        // Surface the whole completion as one delta so a streaming caller always
+        // receives the content through the same callback, not just in the result.
+        if (response.text) onEvent({ type: 'text-delta', text: response.text });
+        for (const toolCall of response.toolCalls) onEvent({ type: 'tool-call', toolCall });
+        onEvent({ type: 'done', response });
+        return response;
+      }
+
+      let text = '';
+      let finish: FinishReason = 'stop';
+      let model = this.model;
+      let rawUsage: Record<string, unknown> | undefined;
+      let terminated = false;
+      const fragments = new Map<number, { id?: string; name: string; args: string }>();
+
+      const handleFrame = (_eventName: string, data: string): void => {
+        if (terminated) return;
+        if (data === '[DONE]') {
+          terminated = true; // the stream is finished; ignore anything after it
+          return;
+        }
+        let chunk: Record<string, unknown>;
+        try {
+          chunk = JSON.parse(data) as Record<string, unknown>;
+        } catch {
+          return; // one malformed chunk must not abort an otherwise good stream
+        }
+        if (typeof chunk['model'] === 'string') model = chunk['model'];
+        const usage = chunk['usage'];
+        if (usage && typeof usage === 'object') rawUsage = usage as Record<string, unknown>;
+
+        const choices = Array.isArray(chunk['choices']) ? (chunk['choices'] as unknown[]) : [];
+        const first = (choices[0] ?? {}) as Record<string, unknown>;
+        const delta = (first['delta'] ?? {}) as Record<string, unknown>;
+
+        if (typeof delta['content'] === 'string' && delta['content']) {
+          text += delta['content'];
+          onEvent({ type: 'text-delta', text: delta['content'] });
+        }
+
+        if (Array.isArray(delta['tool_calls'])) {
+          for (const raw of delta['tool_calls'] as unknown[]) {
+            const tc = (raw ?? {}) as Record<string, unknown>;
+            const index = numOr(tc['index'], 0) ?? 0;
+            let fragment = fragments.get(index);
+            if (!fragment) {
+              fragment = { name: '', args: '' };
+              fragments.set(index, fragment);
+            }
+            // id/name are sent once, on the first fragment for that index.
+            if (typeof tc['id'] === 'string' && tc['id'] && !fragment.id) fragment.id = tc['id'];
+            const fn = (tc['function'] ?? {}) as Record<string, unknown>;
+            if (typeof fn['name'] === 'string' && fn['name'] && !fragment.name) fragment.name = fn['name'];
+            if (typeof fn['arguments'] === 'string') fragment.args += fn['arguments'];
+          }
+        }
+
+        if (first['finish_reason'] !== undefined && first['finish_reason'] !== null) {
+          finish = mapFinish(first['finish_reason']);
+        }
+      };
+
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error('streaming response had no body');
+      const decoder = new TextDecoder();
+      const parser = makeSseParser(handleFrame);
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          // `stream: true` keeps a multi-byte character split across two chunks intact.
+          parser.push(decoder.decode(value, { stream: true }));
+        }
+        parser.push(decoder.decode());
+      } finally {
+        parser.flush(); // a server may end the stream without the final blank line
+        reader.releaseLock();
+      }
+
+      const toolCalls: ToolCall[] = [];
+      for (const index of [...fragments.keys()].sort((a, b) => a - b)) {
+        const fragment = fragments.get(index);
+        if (!fragment) continue;
+        const toolCall: ToolCall = {
+          id: fragment.id ?? `call_${index}`,
+          name: fragment.name,
+          args: parseToolArgs(fragment.args),
+        };
+        toolCalls.push(toolCall);
+        onEvent({ type: 'tool-call', toolCall });
+      }
+
+      const latencyMs = Date.now() - started;
+      const inputTokens = numOr(
+        rawUsage?.['prompt_tokens'],
+        estimateTokens(req.messages.map((m) => m.content).join('\n')),
+      );
+      const outputTokens = numOr(rawUsage?.['completion_tokens'], estimateTokens(text));
+      const cached = numOr(
+        (rawUsage?.['prompt_tokens_details'] as Record<string, unknown> | undefined)?.['cached_tokens'],
+        undefined,
+      );
+      const reasoning = numOr(
+        (rawUsage?.['completion_tokens_details'] as Record<string, unknown> | undefined)?.['reasoning_tokens'],
+        undefined,
+      );
+      const usage: Usage = { inputTokens: inputTokens ?? 0, outputTokens: outputTokens ?? 0 };
+      if (cached !== undefined) usage.cachedInputTokens = cached;
+      if (reasoning !== undefined) usage.reasoningTokens = reasoning;
+
+      let response: ChatResponse;
+      if (!text && toolCalls.length === 0 && finish === 'stop') {
+        // Same rule as `normalize`: an empty completion is a model-level failure,
+        // not a transport one, so it must not look like a successful stop.
+        response = {
+          ...emptyResponse(this.id, this.model, latencyMs, 'provider returned an empty message'),
+          usage,
+          finishReason: 'error',
+        };
+      } else {
+        response = {
+          text,
+          toolCalls,
+          usage,
+          finishReason: finish,
+          model,
+          providerId: this.id,
+          latencyMs,
+          costUsd: computeCost(usage, this.price),
+        };
+      }
+      onEvent({ type: 'done', response });
+      return response;
+    } catch (err) {
+      throw toProviderError(this.id, err, this.baseUrl);
+    } finally {
+      clearTimeout(timer);
+      if (req.signal) req.signal.removeEventListener('abort', onOuterAbort);
+    }
   }
 
   private normalize(parsed: unknown, latencyMs: number, req: ChatRequest): ChatResponse {
@@ -267,6 +484,103 @@ export class OpenAICompatibleProvider implements Provider {
       };
     }
   }
+}
+
+/**
+ * Map the internal transcript onto the chat-completions wire format.
+ *
+ * Both `chat()` and `chatStream()` go through here. An assistant turn that
+ * requested tools must carry `tool_calls` (with `arguments` as a JSON *string*),
+ * because the following `role: "tool"` results are matched to those ids; without
+ * them the API returns a 400 instead of running the tool.
+ */
+function toWireMessages(messages: Message[]): unknown[] {
+  return messages.map((m) => ({
+    role: m.role,
+    content: m.content,
+    ...(m.toolCallId ? { tool_call_id: m.toolCallId } : {}),
+    ...(m.name && m.role === 'tool' ? { name: m.name } : {}),
+    ...(m.toolCalls?.length
+      ? {
+          tool_calls: m.toolCalls.map((c) => ({
+            id: c.id,
+            type: 'function',
+            function: { name: c.name, arguments: JSON.stringify(c.args ?? {}) },
+          })),
+        }
+      : {}),
+  }));
+}
+
+/**
+ * Tool arguments arrive as JSON fragments; the concatenation is only valid once
+ * the stream ends. Malformed or absent JSON still describes a callable tool, so
+ * fall back to `{}` rather than throwing away the call.
+ */
+function parseToolArgs(json: string): unknown {
+  if (!json.trim()) return {};
+  try {
+    return JSON.parse(json);
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Minimal SSE frame splitter.
+ *
+ * Frames are separated by a blank line and carry `event:` / `data:` lines. A
+ * network chunk boundary can fall anywhere — mid-line, mid-frame, even
+ * mid-character (the caller decodes with `{ stream: true }`) — so this buffers
+ * text and only dispatches when it sees the blank line ending a frame. Comment
+ * lines (leading `:`) and `data: [DONE]` are handled by the caller.
+ */
+function makeSseParser(onFrame: (eventName: string, data: string) => void): { push(chunk: string): void; flush(): void } {
+  let pending = '';
+  let eventName = '';
+  let dataLines: string[] = [];
+
+  const dispatch = (): void => {
+    const data = dataLines.join('\n');
+    const name = eventName;
+    eventName = '';
+    dataLines = [];
+    if (!data) return; // keepalive or comment-only frame: nothing to parse
+    onFrame(name, data);
+  };
+
+  const handleLine = (raw: string): void => {
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+    if (line === '') {
+      dispatch();
+      return;
+    }
+    if (line.startsWith(':')) return; // SSE comment, e.g. `: ping`
+    const colon = line.indexOf(':');
+    const field = colon === -1 ? line : line.slice(0, colon);
+    let value = colon === -1 ? '' : line.slice(colon + 1);
+    if (value.startsWith(' ')) value = value.slice(1); // one optional space after the colon, per spec
+    if (field === 'event') eventName = value;
+    else if (field === 'data') dataLines.push(value);
+  };
+
+  return {
+    push(chunk: string): void {
+      pending += chunk;
+      // Split on \n and keep the trailing partial line: a chunk can end mid-line.
+      const lines = pending.split('\n');
+      pending = lines.pop() ?? '';
+      for (const line of lines) handleLine(line);
+    },
+    flush(): void {
+      if (pending) {
+        const line = pending;
+        pending = '';
+        handleLine(line);
+      }
+      dispatch(); // a generous server may omit the trailing blank line
+    },
+  };
 }
 
 function numOr(value: unknown, fallback: number | undefined): number | undefined {

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Launcher for the interactive coding agent. Symlink this onto your PATH so that
+# `cd anywhere && proto-code` starts a session rooted in that directory, the same
+# way other coding agents work.
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+exec node --experimental-strip-types --disable-warning=ExperimentalWarning "$ROOT/src/cli.ts" code "$@"
