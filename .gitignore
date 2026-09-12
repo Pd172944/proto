@@ -5,6 +5,9 @@ var/
 # Local secrets (never commit). Prefer environment variables.
 secrets.json
 
+# HumanEval playground (vendored dataset + scratch work dirs)
+humaneval/
+
 # Training artifacts
 *.gguf
 *.safetensors

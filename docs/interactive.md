@@ -282,6 +282,77 @@ style, and it is cheaper and more reliable than putting it in every message.
 
 ---
 
+## Trying it on HumanEval
+
+HumanEval is 164 single-function problems with hidden assertions. It clones to
+**~270 KB** (the dataset itself is 45 KB gzipped), so size is never a concern.
+
+```bash
+python3 scripts/humaneval.py setup          # clone + extract
+python3 scripts/humaneval.py list --limit 20
+python3 scripts/humaneval.py show 0         # prepare problem 0 and print instructions
+#   ... play with the CLI in the printed workspace ...
+python3 scripts/humaneval.py check 0        # run the hidden tests
+python3 scripts/humaneval.py run --count 5  # automated pass@1
+```
+
+It lives in `humaneval/`, **not** `test/` — `test/` is this project's own suite (16
+files, ~6,000 lines) and mixing a vendored dataset into it would be a mess. The
+`humaneval/` directory is gitignored.
+
+### What each command is for
+
+| Command | Purpose |
+|---|---|
+| `show <n>` | Writes `solution.py` with the signature and docstring, prints the task, and prints the exact `proto-code` command and opening message to paste |
+| `check <n>` | Imports the candidate and runs HumanEval's real assertions |
+| `run` | For each problem: fresh dir, fresh `PROTO_HOME`, drive `proto code --print --yes`, then check. Reports pass@1 and spend |
+| `reset <n>` | Restore the stub |
+
+`run` gives every problem its own `PROTO_HOME`, so an evaluation never touches your
+real `var/` episodes or sessions.
+
+### Read this before believing the number
+
+**HumanEval is close to the worst possible benchmark for an *agentic* harness**, and
+a good one for a plain completion model. It has no repository to explore, no
+searchable code, no tests the agent can see, and one function per problem. So it
+exercises almost none of what makes an agent useful, while actively penalising the
+one thing agents do that single-shot models do not: spend extra turns.
+
+Concretely, what the number is and isn't:
+
+- **It is** a smoke test that the loop, the tools, the provider and the wire format
+  all work end to end on real tasks with real hidden tests. That is genuinely worth
+  having, and it is what this is for.
+- **It is not** a verdict on the harness. A bare completion model will often score
+  *higher* on HumanEval than the same model inside an agent loop.
+- The agent is free to write its own scratch checks, so this is **agentic pass@1**,
+  not model pass@1 — a legitimate but different measurement.
+- One sample per problem at an unpinned temperature makes it noisy. Do not compare
+  two models on a 5-problem run without expecting ±20% swings.
+- Model-generated Python is executed to check the answer, which is the same trust you
+  already extend by letting the agent run commands.
+
+If you want a measurement that reflects what this harness is for, use tasks with a
+repo, a failing test and room to iterate — `proto code` on your own codebase, or
+SWE-bench-style issues. HumanEval will only ever measure the least interesting part.
+
+### Useful flags
+
+```bash
+python3 scripts/humaneval.py run --count 10 --start 20        # problems 20-29
+python3 scripts/humaneval.py run --count 5 --agent local      # test the local model
+python3 scripts/humaneval.py run --count 5 --agent demo       # proves the plumbing, scores 0
+python3 scripts/humaneval.py run --count 10 --model claude-haiku-4-5
+python3 scripts/humaneval.py run --count 3 --verbose          # show the failing assertions
+```
+
+`--agent demo` scoring 0/3 is the *correct* result: the demo provider is read-only
+and cannot write `solution.py`. If it ever scores non-zero, something is wrong.
+
+---
+
 ## Non-interactive use
 
 ```bash

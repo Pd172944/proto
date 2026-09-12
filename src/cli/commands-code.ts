@@ -202,6 +202,8 @@ export const codeCommand: Command = {
     { name: 'resume', type: 'boolean', description: 'continue the most recent session' },
     { name: 'no-color', type: 'boolean', description: 'disable colour output' },
     { name: 'demo', type: 'boolean', description: 'scripted read-only demo: see the full harness with no key and no model' },
+    { name: 'provider', type: 'string', description: 'override the cloud provider for this session (e.g. anthropic)' },
+    { name: 'model', type: 'string', description: 'override the model for this session' },
   ],
   async run(ctx): Promise<CommandResult> {
     // Colour mode is decided by the theme module's auto rules (NO_COLOR, TTY,
@@ -220,18 +222,36 @@ export const codeCommand: Command = {
     const useDemo = flagBool(ctx.args, 'demo');
     const selectProvider = (want: 'cloud' | 'local', model?: string): ProviderChoice => {
       if (useDemo) return { provider: new DemoProvider(), label: 'demo · scripted', isLocal: false };
-      if (want === 'local') return chooseProvider(ctx, 'local');
+      if (want === 'local') return chooseProvider({ ...ctx, cfg: runCfg }, 'local');
       if (model) {
-        const provider = buildCloudProvider(ctx.cfg, ctx.dataDir, model);
+        const provider = buildCloudProvider(runCfg, ctx.dataDir, model);
         if (!provider) throw new Error(`no cloud provider available for model "${model}"`);
-        return { provider, label: `${ctx.cfg.cloud.provider} · ${model}`, isLocal: false };
+        return { provider, label: `${runCfg.cloud.provider} · ${model}`, isLocal: false };
       }
-      return chooseProvider(ctx, 'cloud');
+      return chooseProvider({ ...ctx, cfg: runCfg }, 'cloud');
     };
+
+    // A per-run provider/model override is what makes scripted evaluation possible:
+    // comparing two models on the same task set without editing config between runs.
+    const providerFlag = flagString(ctx.args, 'provider');
+    const modelFlag = flagString(ctx.args, 'model');
+    const runCfg = providerFlag ? { ...ctx.cfg, cloud: { ...ctx.cfg.cloud, provider: providerFlag } } : ctx.cfg;
 
     let choice: ProviderChoice;
     try {
-      choice = selectProvider(flagBool(ctx.args, 'local') ? 'local' : 'cloud');
+      if (useDemo) {
+        choice = { provider: new DemoProvider(), label: 'demo · scripted', isLocal: false };
+      } else if (flagBool(ctx.args, 'local')) {
+        choice = chooseProvider(ctx, 'local');
+      } else {
+        const provider = buildCloudProvider(runCfg, ctx.dataDir, modelFlag ?? cloudTierModel(runCfg, 'cloud-strong'));
+        if (!provider) throw new Error('no cloud provider available. Set an API key, or use --local / --demo.');
+        choice = {
+          provider,
+          label: `${runCfg.cloud.provider} · ${provider.model}`,
+          isLocal: false,
+        };
+      }
     } catch (err) {
       return { human: [palette.error(err instanceof Error ? err.message : String(err))], json: { ok: false, error: String(err) }, exitCode: 1 };
     }
@@ -293,6 +313,9 @@ export const codeCommand: Command = {
 
     let abortController: AbortController | null = null;
     let exitCode = 0;
+    // The last failure reason, so `--json` carries it. Without this a scripted caller
+    // sees `ok: false` with no explanation and has to scrape prose off stdout.
+    let lastError: string | undefined;
 
     const onSigint = (): void => {
       if (abortController && !abortController.signal.aborted) {
@@ -405,6 +428,7 @@ export const codeCommand: Command = {
 
           case 'notice':
             out(`  ${event.level === 'error' ? palette.error('✗') : palette.warn('!')} ${palette.dim(event.text)}`);
+            if (event.level === 'error') lastError = event.text;
             break;
 
           case 'usage':
@@ -467,6 +491,7 @@ export const codeCommand: Command = {
         spinner.stop();
         const message = err2 instanceof ProviderError ? `${err2.message}${err2.hint ? ` — ${err2.hint}` : ''}` : String(err2);
         err(palette.error(`  ${message}`));
+        lastError = message;
         exitCode = 1;
       } finally {
         abortController = null;
@@ -576,7 +601,13 @@ export const codeCommand: Command = {
       const saved = saveSession(ctx.dataDir, session);
       return {
         human: [],
-        json: { ok: exitCode === 0, session: session.id, transcript: saved, stats: session.stats },
+        json: {
+          ok: exitCode === 0,
+          ...(lastError ? { error: lastError } : {}),
+          session: session.id,
+          transcript: saved,
+          stats: session.stats,
+        },
         exitCode,
       };
     }
@@ -636,7 +667,7 @@ export const codeCommand: Command = {
 
     return {
       human: [],
-      json: { ok: exitCode === 0, session: session.id, stats: session.stats },
+      json: { ok: exitCode === 0, ...(lastError ? { error: lastError } : {}), session: session.id, stats: session.stats },
       exitCode,
     };
   },
