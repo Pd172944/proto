@@ -3,7 +3,8 @@
 A **coding agent** for your terminal, and the two-regime harness underneath it.
 
 ```bash
-cd ~/my-project && proto code        # an agent that reads, edits and runs commands
+./scripts/install.sh                 # link `proto` and `proto-code` onto your PATH
+cd ~/my-project && proto-code        # an agent that reads, edits and runs commands
 ```
 
 Then, if you want the local/cloud economics: easy work goes to a fast model on your

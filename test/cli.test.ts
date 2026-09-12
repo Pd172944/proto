@@ -113,6 +113,17 @@ describe('cli: launchers actually execute', () => {
     assert.match(res.stdout, /interactive coding agent/);
   });
 
+  it('bin/proto works through a symlink on PATH', async () => {
+    // `proto` and `proto-code` are separate launchers, and linking only one of them
+    // produces a confusing "command not found" for the other. Both paths are covered.
+    const bin = tempDir();
+    const link = join(bin, 'proto');
+    symlinkSync(join(REPO, 'bin', 'proto'), link);
+    const res = await runLauncher(link, ['help'], { cwd: tempDir() });
+    assert.equal(res.code, 0, res.stderr);
+    assert.match(res.stdout, /usage: proto/);
+  });
+
   it('bin/proto-code resolves its root correctly from a relative invocation', async () => {
     const res = await runLauncher('bin/proto-code', ['--help'], { cwd: REPO });
     assert.equal(res.code, 0, res.stderr);

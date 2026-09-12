@@ -138,28 +138,46 @@ turn learns to ignore the nags.
 
 ## Running it from anywhere
 
-The launcher needs to be on your `PATH` so you can `cd` into any project and start a
-session there:
+There are **two** launchers and `proto` is the one that gives you every command:
+
+| Command | What it is |
+|---|---|
+| `proto` | the whole CLI — `doctor`, `code`, `route`, `eval`, `train`, … |
+| `proto-code` | a shortcut that runs `proto code` directly |
+
+Link both (the installer does exactly this):
 
 ```bash
-# one option: symlink it (no sudo, works for the current user)
-mkdir -p ~/.local/bin
-ln -sf /Users/prithvidixit/Desktop/sky/personalHarness/proto/bin/proto-code ~/.local/bin/proto-code
-export PATH="$HOME/.local/bin:$PATH"     # add to ~/.zshrc to make it stick
+/Users/prithvidixit/Desktop/sky/personalHarness/proto/scripts/install.sh
 ```
 
-Then:
+Then, from any directory:
 
 ```bash
+proto doctor --probe-cloud
 cd ~/any/project && proto-code
 ```
 
-If you would rather not touch your PATH, run it directly with the full path, or use
-an alias:
+The installer does four things and is safe to re-run:
 
-```bash
-alias pc='/Users/prithvidixit/Desktop/sky/personalHarness/proto/bin/proto-code'
-```
+1. symlinks both launchers into `~/.local/bin` (override with `--bin-dir`)
+2. **runs them to verify they work** — a launcher that resolves the wrong repository
+   root is syntactically valid and only fails at runtime, so checking the file is not
+   enough
+3. reports whether the bin directory is on your `PATH`, and adds it to your shell rc
+   only if you pass `--write-rc` (editing your rc file is opt-in)
+4. reverses everything with `--uninstall`, including removing the rc block it added
+
+Other flags: `--dry-run` to preview, `--bin-dir DIR` for a different location.
+
+**The two mistakes this is designed to prevent**, both of which cost real debugging
+time:
+
+- Linking only one launcher. `proto-code` on your `PATH` does not make `proto`
+  available; they are separate scripts.
+- `export PATH=...` in one terminal does not affect any other terminal, and does not
+  survive a new window. Put it in `~/.zshrc` (which `--write-rc` does), or use the
+  full path.
 
 The session root is the directory you launch from, and it is shown in the banner. A
 session cannot write outside it.
