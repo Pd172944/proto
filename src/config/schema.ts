@@ -233,6 +233,28 @@ export interface CloudConfig {
   requestTimeoutMs: number;
   /** Prompt-cache the stable prefix when the provider supports it. */
   promptCaching: boolean;
+  /**
+   * Extra headers sent with every cloud request.
+   *
+   * A general escape hatch, because gateways and enterprise proxies routinely need
+   * one: Azure wants `api-version`, some proxies want a routing or tracing header.
+   * Reaching for a code change every time a proxy wants a header is not reasonable.
+   */
+  extraHeaders?: Record<string, string>;
+  /**
+   * Anthropic workspace id, sent as the `anthropic-workspace-id` header.
+   *
+   * Some Anthropic keys are **not scoped to a workspace**, and the API rejects every
+   * request from them with a 400 until this header is present:
+   *
+   *   "This API key is not scoped to a workspace, so this request must include the
+   *    anthropic-workspace-id header with the ID of the workspace to use."
+   *
+   * The alternative fix is to create a key *inside* a workspace in the Anthropic
+   * Console, which then needs no header at all. Both are supported; see
+   * docs/interactive.md.
+   */
+  workspaceId?: string;
 }
 
 export interface RoutingConfig {

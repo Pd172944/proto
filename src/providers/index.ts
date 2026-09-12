@@ -143,8 +143,14 @@ export function buildCloudProvider(cfg: ProtoConfig, dataDir?: string, modelOver
   const baseUrl = cloudBaseUrl(cfg);
   const model = modelOverride ?? cfg.cloud.model;
   const price = priceFor(cfg, model);
+  // Profile defaults first, then the user's own headers, so the user always wins.
+  const extraHeaders = { ...(profile?.extraHeaders ?? {}), ...(cfg.cloud.extraHeaders ?? {}) };
 
   if (cloudApiShape(cfg) === 'anthropic') {
+    const workspaceId =
+      cfg.cloud.workspaceId?.trim() ||
+      process.env['ANTHROPIC_WORKSPACE_ID']?.trim() ||
+      process.env['PROTO_CLOUD_WORKSPACE_ID']?.trim();
     return new AnthropicProvider({
       id: cfg.cloud.provider,
       label: profile?.label ?? 'Anthropic',
@@ -155,6 +161,8 @@ export function buildCloudProvider(cfg: ProtoConfig, dataDir?: string, modelOver
       timeoutMs: cfg.cloud.requestTimeoutMs,
       effort: cfg.cloud.effort,
       promptCaching: cfg.cloud.promptCaching,
+      extraHeaders,
+      ...(workspaceId ? { workspaceId } : {}),
     });
   }
 
@@ -167,7 +175,7 @@ export function buildCloudProvider(cfg: ProtoConfig, dataDir?: string, modelOver
     apiKey,
     price,
     timeoutMs: cfg.cloud.requestTimeoutMs,
-    extraHeaders: profile?.extraHeaders,
+    extraHeaders,
     supportsJsonSchema: false,
   });
 }

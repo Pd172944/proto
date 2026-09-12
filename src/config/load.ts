@@ -104,6 +104,10 @@ export function applyEnvOverrides(cfg: ProtoConfig): ProtoConfig {
   if (cloudModel) out.cloud.model = cloudModel;
   const cloudUrl = envStr('PROTO_CLOUD_BASE_URL');
   if (cloudUrl) out.cloud.baseUrl = cloudUrl;
+  // Anthropic accepts either the generic name or its own conventional one.
+  const workspaceId = envStr('PROTO_CLOUD_WORKSPACE_ID') ?? envStr('ANTHROPIC_WORKSPACE_ID');
+  if (workspaceId) out.cloud.workspaceId = workspaceId;
+
   const effort = envStr('PROTO_CLOUD_EFFORT');
   if (effort && ['auto', 'low', 'medium', 'high'].includes(effort)) {
     out.cloud.effort = effort as ProtoConfig['cloud']['effort'];

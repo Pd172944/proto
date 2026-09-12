@@ -178,6 +178,14 @@ const doctor: Command = {
     // When a key is missing, show which provider keys *are* set. Without this, a
     // user with ANTHROPIC_API_KEY and the default OpenRouter provider sees only
     // "missing" and has no idea why.
+    // Anthropic keys are sometimes not scoped to a workspace, in which case every
+    // request needs this header. Surface the setting so it is discoverable before the
+    // 400, not after.
+    if (ctx.cfg.cloud.provider === 'anthropic' && keyPresent) {
+      const ws = ctx.cfg.cloud.workspaceId?.trim() ?? process.env['ANTHROPIC_WORKSPACE_ID']?.trim();
+      human.push(`  workspace id  ${ws ? style.green(ws) : style.dim('not set (only needed for unscoped keys)')}`);
+    }
+
     if (!keyPresent) {
       const present = PROVIDER_PROFILES.filter((p) =>
         p.keyEnv.some((name) => Boolean(process.env[name]?.trim())),

@@ -296,6 +296,7 @@ style, and it is cheaper and more reliable than putting it in every message.
 | No colour | `NO_COLOR` set or not a TTY | `PROTO_COLOR=1` forces it |
 | `doctor` says the local model is not downloaded | you pulled a different model | `proto models use <name>` adopts one you already have; the runtime is never switched silently |
 | `api key missing` though you exported one | the default provider is OpenRouter, so it looks for `OPENROUTER_API_KEY` | a key for any known provider is auto-selected, and `doctor` now prints which key names it found |
+| `400 ... not scoped to a workspace` | your Anthropic key is organisation-level, not workspace-scoped, so the API needs `anthropic-workspace-id` | see below |
 | It stops mid-task | step or time budget | raise `--max-steps` / `--deadline-min` |
 
 ---
@@ -368,6 +369,50 @@ python3 scripts/humaneval.py run --count 3 --verbose          # show the failing
 
 `--agent demo` scoring 0/3 is the *correct* result: the demo provider is read-only
 and cannot write `solution.py`. If it ever scores non-zero, something is wrong.
+
+---
+
+
+### Anthropic: "This API key is not scoped to a workspace"
+
+A 400 like this means the request never reached a model — it costs nothing and
+happens before any tokens are generated:
+
+```
+Anthropic HTTP 400: This API key is not scoped to a workspace, so this request must
+include the anthropic-workspace-id header with the ID of the workspace to use.
+```
+
+Some Anthropic API keys are organisation-level rather than belonging to a specific
+workspace. The Anthropic API rejects every request from such a key until it is told
+which workspace to bill and attribute the usage to. Two fixes, either is fine:
+
+**Option A — use a workspace-scoped key (usually easier).** In the Anthropic Console,
+open **Settings → Workspaces**, pick or create a workspace, and create the API key
+from *inside* that workspace. Keys created that way carry their scope and need no
+header at all. Then replace the key in your shell/env.
+
+**Option B — tell the harness the workspace id.** Copy the workspace id from the same
+Console page (workspace ids look like `wrkspc_…`; an org admin can also list them via
+the Admin API's `GET /v1/organizations/workspaces`), then:
+
+```bash
+proto config set cloud.workspaceId wrkspc_xxxxxxxx
+# or, without touching config:
+export ANTHROPIC_WORKSPACE_ID=wrkspc_xxxxxxxx
+```
+
+`proto doctor` shows whether a workspace id is in effect. If you set one and still get
+a workspace error, the harness will now say the header *was sent and rejected*, which
+means the id is wrong or belongs to a different organisation than the key.
+
+**Sending other headers.** Some gateways and enterprise proxies need their own header
+(Azure wants `api-version`, tracing proxies want a correlation id). Rather than
+requiring a code change, `cloud.extraHeaders` takes an arbitrary map:
+
+```bash
+proto config set cloud.extraHeaders '{"x-my-proxy-header":"value"}'
+```
 
 ---
 

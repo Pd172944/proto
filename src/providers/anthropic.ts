@@ -41,6 +41,10 @@ export interface AnthropicOptions {
   /** 'auto' | 'low' | 'medium' | 'high' -> thinking token budget. */
   effort: 'auto' | 'low' | 'medium' | 'high';
   promptCaching: boolean;
+  /** Extra headers to send with every request. */
+  extraHeaders?: Record<string, string>;
+  /** Sent as `anthropic-workspace-id` when set. */
+  workspaceId?: string;
   version?: string;
 }
 
@@ -72,6 +76,7 @@ export class AnthropicProvider implements Provider {
   private readonly effort: 'auto' | 'low' | 'medium' | 'high';
   private readonly promptCaching: boolean;
   private readonly version: string;
+  private readonly extraHeaders: Record<string, string>;
 
   constructor(opts: AnthropicOptions) {
     this.id = opts.id;
@@ -83,12 +88,18 @@ export class AnthropicProvider implements Provider {
     this.effort = opts.effort;
     this.promptCaching = opts.promptCaching;
     this.version = opts.version ?? ANTHROPIC_VERSION;
+    this.extraHeaders = { ...(opts.extraHeaders ?? {}) };
+    // Some keys are not scoped to a workspace and are rejected outright without this
+    // header. Sending it is harmless for keys that are scoped.
+    const workspace = opts.workspaceId?.trim();
+    if (workspace) this.extraHeaders['anthropic-workspace-id'] = workspace;
   }
 
   private headers(): Record<string, string> {
     const h: Record<string, string> = {
       'content-type': 'application/json',
       'anthropic-version': this.version,
+      ...this.extraHeaders,
     };
     if (this.apiKey) h['x-api-key'] = this.apiKey;
     return h;
@@ -160,9 +171,11 @@ export class AnthropicProvider implements Provider {
     const latencyMs = Date.now() - started;
 
     if (!res.ok) {
-      throw new ProviderError(this.id, `Anthropic HTTP ${res.status}: ${errorText(res.text)}`, {
+      const detail = errorText(res.text);
+      throw new ProviderError(this.id, `Anthropic HTTP ${res.status}: ${detail}`, {
         status: res.status,
         retryable: res.status === 429 || res.status === 529 || res.status >= 500,
+        ...(workspaceHint(detail, this.extraHeaders) ? { hint: workspaceHint(detail, this.extraHeaders) as string } : {}),
       });
     }
 
@@ -224,9 +237,11 @@ export class AnthropicProvider implements Provider {
 
       if (!res.ok) {
         const detail = errorText(await res.text().catch(() => ''));
+        const hint = workspaceHint(detail, this.extraHeaders);
         throw new ProviderError(this.id, `Anthropic HTTP ${res.status}: ${detail}`, {
           status: res.status,
           retryable: res.status === 429 || res.status === 529 || res.status >= 500,
+          ...(hint ? { hint } : {}),
         });
       }
 
@@ -631,6 +646,25 @@ function makeSseParser(onFrame: (eventName: string, data: string) => void): { pu
       dispatch(); // a generous server may omit the trailing blank line
     },
   };
+}
+
+/**
+ * Turn Anthropic's workspace-scoping 400 into something the user can act on.
+ *
+ * The raw message tells you *what* is missing but not *how* to fix it in this
+ * harness, and it is the kind of error people hit once and then lose twenty minutes
+ * to. Returns undefined for every other error.
+ */
+function workspaceHint(detail: string, headersSent: Record<string, string>): string | undefined {
+  if (!/workspace/i.test(detail)) return undefined;
+  if (headersSent['anthropic-workspace-id']) {
+    return `An anthropic-workspace-id header was sent and rejected. Check that the workspace id is correct and belongs to the same organisation as the key.`;
+  }
+  return (
+    `This key is not scoped to a workspace. Either set the workspace id ` +
+    `(\`proto config set cloud.workspaceId <id>\`, or export ANTHROPIC_WORKSPACE_ID), ` +
+    `or create an API key inside a specific workspace in the Anthropic Console, which needs no header.`
+  );
 }
 
 function errorText(text: string): string {

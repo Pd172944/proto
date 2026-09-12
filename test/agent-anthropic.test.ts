@@ -29,6 +29,7 @@ import { tempDir } from './helpers.ts';
 interface Captured {
   body: Record<string, unknown>;
   path: string;
+  headers: Record<string, string>;
 }
 
 /** A single-use Anthropic-shaped server that replays a script of responses. */
@@ -45,15 +46,20 @@ async function withAnthropicServer(
       raw += c.toString('utf8');
     });
     req.on('end', () => {
+      const headers: Record<string, string> = {};
+      for (const [k, v] of Object.entries(req.headers)) {
+        headers[k.toLowerCase()] = Array.isArray(v) ? v.join(',') : String(v ?? '');
+      }
       try {
-        captures.push({ body: JSON.parse(raw) as Record<string, unknown>, path: req.url ?? '' });
+        captures.push({ body: JSON.parse(raw) as Record<string, unknown>, path: req.url ?? '', headers });
       } catch {
-        captures.push({ body: {}, path: req.url ?? '' });
+        captures.push({ body: {}, path: req.url ?? '', headers });
       }
       const payload = responses[Math.min(index, responses.length - 1)] ?? { content: [] };
       index++;
+      const status = typeof (payload as { status?: number }).status === 'number' ? (payload as { status: number }).status : 200;
       const body = JSON.stringify(payload);
-      res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+      res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
       res.end(body);
     });
   });
@@ -126,10 +132,14 @@ async function withAnthropicSseServer(
       raw += c.toString('utf8');
     });
     req.on('end', () => {
+      const headers: Record<string, string> = {};
+      for (const [k, v] of Object.entries(req.headers)) {
+        headers[k.toLowerCase()] = Array.isArray(v) ? v.join(',') : String(v ?? '');
+      }
       try {
-        captures.push({ body: JSON.parse(raw) as Record<string, unknown>, path: req.url ?? '' });
+        captures.push({ body: JSON.parse(raw) as Record<string, unknown>, path: req.url ?? '', headers });
       } catch {
-        captures.push({ body: {}, path: req.url ?? '' });
+        captures.push({ body: {}, path: req.url ?? '', headers });
       }
       const body = turns[Math.min(index, turns.length - 1)] ?? '';
       index++;
@@ -310,6 +320,168 @@ describe('end-to-end: Anthropic wire format → agent loop → real tool', () =>
           .find((b) => b.type === 'tool_result');
         assert.match(String(toolResult?.content ?? ''), /return sum\(items\)/);
         assert.equal(result.usage.outputTokens, 37, 'output tokens from both message_delta frames');
+      },
+    );
+  });
+
+  it('sends anthropic-workspace-id when a workspace id is configured', async () => {
+    // Some Anthropic keys are not scoped to a workspace and every request from them is
+    // rejected with a 400 until this header is present, so this is not cosmetic.
+    const dir = tempDir();
+    let seen: Record<string, string> = {};
+    await withAnthropicServer([anthropicMessage([{ type: 'text', text: 'ok' }])], async ({ baseUrl, captures }) => {
+      const provider = new AnthropicProvider({
+        id: 'anthropic',
+        label: 'Anthropic',
+        model: 'claude-test',
+        baseUrl,
+        apiKey: 'k',
+        price: { in: 3, out: 15 },
+        timeoutMs: 10_000,
+        effort: 'auto',
+        promptCaching: true,
+        workspaceId: 'wrkspc_abc123',
+        extraHeaders: { 'x-custom-header': 'from-config' },
+      });
+      await runAgentTurn({
+        provider,
+        tools: buildToolRegistry(),
+        workspace: dir,
+        history: [],
+        input: 'hi',
+        project: { workspace: dir, platform: 'test' },
+        approve: async () => 'allow-once',
+        skipReminders: true,
+      });
+      seen = captures[0]?.headers ?? {};
+    });
+    assert.equal(seen['anthropic-workspace-id'], 'wrkspc_abc123');
+    assert.equal(seen['x-custom-header'], 'from-config');
+    // The required Anthropic headers must still be present alongside them.
+    assert.ok(seen['x-api-key']);
+    assert.ok(seen['anthropic-version']);
+  });
+
+  it('omits the workspace header when none is configured', async () => {
+    const dir = tempDir();
+    let seen: Record<string, string> = {};
+    await withAnthropicServer([anthropicMessage([{ type: 'text', text: 'ok' }])], async ({ baseUrl, captures }) => {
+      const provider = new AnthropicProvider({
+        id: 'anthropic',
+        label: 'Anthropic',
+        model: 'claude-test',
+        baseUrl,
+        apiKey: 'k',
+        price: { in: 3, out: 15 },
+        timeoutMs: 10_000,
+        effort: 'auto',
+        promptCaching: true,
+      });
+      await runAgentTurn({
+        provider,
+        tools: buildToolRegistry(),
+        workspace: dir,
+        history: [],
+        input: 'hi',
+        project: { workspace: dir, platform: 'test' },
+        approve: async () => 'allow-once',
+        skipReminders: true,
+      });
+      seen = captures[0]?.headers ?? {};
+    });
+    assert.equal(seen['anthropic-workspace-id'], undefined);
+  });
+
+  it('turns the workspace 400 into instructions, not a restatement', async () => {
+    // The real error is: "This API key is not scoped to a workspace, so this request
+    // must include the anthropic-workspace-id header ...". It says what is missing but
+    // not how to fix it here, and it is the kind of message that costs twenty minutes.
+    const dir = tempDir();
+    const workspaceError = {
+      status: 400,
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        message:
+          'This API key is not scoped to a workspace, so this request must include the ' +
+          'anthropic-workspace-id header with the ID of the workspace to use.',
+      },
+    };
+
+    await withAnthropicServer([workspaceError], async ({ baseUrl }) => {
+      const notices: string[] = [];
+      const provider = new AnthropicProvider({
+        id: 'anthropic',
+        label: 'Anthropic',
+        model: 'claude-test',
+        baseUrl,
+        apiKey: 'k',
+        price: { in: 3, out: 15 },
+        timeoutMs: 10_000,
+        effort: 'auto',
+        promptCaching: true,
+      });
+      await runAgentTurn({
+        provider,
+        tools: buildToolRegistry(),
+        workspace: dir,
+        history: [],
+        input: 'hi',
+        project: { workspace: dir, platform: 'test' },
+        approve: async () => 'allow-once',
+        skipReminders: true,
+        onEvent: (e) => {
+          if (e.type === 'notice') notices.push(e.text);
+        },
+      });
+      const text = notices.join(' ');
+      assert.match(text, /400/, 'the HTTP status must be reported');
+      assert.match(text, /workspace/i);
+      assert.match(text, /cloud\.workspaceId|ANTHROPIC_WORKSPACE_ID/, 'the fix must be named');
+      assert.match(text, /create an API key inside a specific workspace/i);
+    });
+  });
+
+  it('says the header was rejected when one was already sent', async () => {
+    // Otherwise the user sets the id, sees the same message, and concludes the setting
+    // does nothing.
+    const dir = tempDir();
+    await withAnthropicServer(
+      [
+        {
+          status: 400,
+          type: 'error',
+          error: { type: 'invalid_request_error', message: 'The workspace id is not valid for this organization.' },
+        },
+      ],
+      async ({ baseUrl }) => {
+        const notices: string[] = [];
+        const provider = new AnthropicProvider({
+          id: 'anthropic',
+          label: 'Anthropic',
+          model: 'claude-test',
+          baseUrl,
+          apiKey: 'k',
+          price: { in: 3, out: 15 },
+          timeoutMs: 10_000,
+          effort: 'auto',
+          promptCaching: true,
+          workspaceId: 'wrkspc_wrong',
+        });
+        await runAgentTurn({
+          provider,
+          tools: buildToolRegistry(),
+          workspace: dir,
+          history: [],
+          input: 'hi',
+          project: { workspace: dir, platform: 'test' },
+          approve: async () => 'allow-once',
+          skipReminders: true,
+          onEvent: (e) => {
+            if (e.type === 'notice') notices.push(e.text);
+          },
+        });
+        assert.match(notices.join(' '), /header was sent and rejected/);
       },
     );
   });
