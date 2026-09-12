@@ -1,0 +1,170 @@
+/**
+ * The provider contract.
+ *
+ * Everything the harness knows about a model lives behind this interface, so
+ * the router can reason about cost/latency/capability without knowing whether
+ * the other end is a 1.5B model on the user's laptop or an API behind a key.
+ *
+ * Two rules that keep the rest of the system honest:
+ *  - `chat()` never throws for a *model-level* failure (bad output, empty
+ *    response); it returns a response with `finishReason: 'error'`. It throws
+ *    `ProviderError` only for transport/auth problems the caller should treat
+ *    as "this tier is unusable right now".
+ *  - `costUsd` is always computed from normalized `Usage` + the local price
+ *    table, so an episode's recorded cost is comparable across providers.
+ */
+
+import type { Price } from '../config/schema.ts';
+
+export type Role = 'system' | 'user' | 'assistant' | 'tool';
+
+export interface Message {
+  role: Role;
+  content: string;
+  /** Tool name for `tool` messages, or an optional speaker label. */
+  name?: string;
+  toolCallId?: string;
+  /** Mark this message as a cache boundary where the provider supports it. */
+  cacheBreakpoint?: boolean;
+}
+
+export interface ToolSpec {
+  name: string;
+  description: string;
+  /** JSON Schema for the arguments. */
+  parameters: Record<string, unknown>;
+}
+
+export interface ToolCall {
+  id: string;
+  name: string;
+  args: unknown;
+}
+
+export interface Usage {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens?: number;
+  reasoningTokens?: number;
+  /** True when the numbers are heuristic estimates rather than provider-reported. */
+  estimated?: boolean;
+}
+
+export type FinishReason = 'stop' | 'length' | 'tool_calls' | 'content_filter' | 'error';
+
+export interface ChatRequest {
+  messages: Message[];
+  tools?: ToolSpec[];
+  maxTokens?: number;
+  temperature?: number;
+  topP?: number;
+  /** Ask for a JSON object conforming to this schema, when supported. */
+  jsonSchema?: Record<string, unknown>;
+  stop?: string[];
+  signal?: AbortSignal;
+  /** Free-form metadata for logging (never sent to the provider). */
+  meta?: Record<string, unknown>;
+}
+
+export interface ChatResponse {
+  text: string;
+  toolCalls: ToolCall[];
+  usage: Usage;
+  finishReason: FinishReason;
+  model: string;
+  providerId: string;
+  latencyMs: number;
+  /** Estimated USD for this single call. */
+  costUsd: number;
+  /** Populated when finishReason === 'error'. */
+  error?: string;
+}
+
+export interface ProviderCapabilities {
+  /** Supports native tool/function calling. */
+  tools: boolean;
+  /** Supports a JSON-schema-constrained response format. */
+  jsonSchema: boolean;
+  streaming: boolean;
+  /** Accepts `cache_control` style prompt caching. */
+  promptCaching: boolean;
+  contextWindow: number;
+  maxOutputTokens: number;
+}
+
+export type ProviderKind = 'cloud' | 'local';
+
+export interface Provider {
+  readonly id: string;
+  readonly label: string;
+  readonly kind: ProviderKind;
+  readonly model: string;
+  readonly capabilities: ProviderCapabilities;
+  chat(req: ChatRequest): Promise<ChatResponse>;
+  /** Cheap liveness probe; used by `doctor` and by the router's tier vetoes. */
+  health(): Promise<Health>;
+}
+
+export interface Health {
+  ok: boolean;
+  detail: string;
+  latencyMs?: number;
+  /** Models the runtime reports as available locally. */
+  models?: string[];
+  /** True when the endpoint is refusing connections, i.e. server not running. */
+  unreachable?: boolean;
+  /** Actionable next step shown directly to the user. */
+  hint?: string;
+}
+
+export class ProviderError extends Error {
+  readonly providerId: string;
+  readonly status: number;
+  readonly retryable: boolean;
+  readonly hint?: string;
+
+  constructor(
+    providerId: string,
+    message: string,
+    opts: { status?: number; retryable?: boolean; hint?: string } = {},
+  ) {
+    super(message);
+    this.name = 'ProviderError';
+    this.providerId = providerId;
+    this.status = opts.status ?? 0;
+    this.retryable = opts.retryable ?? false;
+    this.hint = opts.hint;
+  }
+}
+
+/** Compute USD cost from normalized usage. */
+export function computeCost(usage: Usage, price: Price): number {
+  const cached = usage.cachedInputTokens ?? 0;
+  const fresh = Math.max(0, usage.inputTokens - cached);
+  const cachedRate = price.cachedIn ?? price.in;
+  const usd =
+    (fresh / 1_000_000) * price.in +
+    (cached / 1_000_000) * cachedRate +
+    (usage.outputTokens / 1_000_000) * price.out;
+  // Round to sub-cent precision; keeping full float noise in logs is unhelpful.
+  return Math.round(usd * 1e6) / 1e6;
+}
+
+export function emptyResponse(
+  providerId: string,
+  model: string,
+  latencyMs: number,
+  error: string,
+): ChatResponse {
+  return {
+    text: '',
+    toolCalls: [],
+    usage: { inputTokens: 0, outputTokens: 0 },
+    finishReason: 'error',
+    model,
+    providerId,
+    latencyMs,
+    costUsd: 0,
+    error,
+  };
+}

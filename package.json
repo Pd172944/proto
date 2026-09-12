@@ -1,0 +1,29 @@
+{
+  "name": "proto-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Two-regime coding harness: a very fast local model for easy tasks and a cloud model for hard ones, with deferred local RL from logged episodes.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "bin": {
+    "proto": "./bin/proto"
+  },
+  "scripts": {
+    "proto": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/cli.ts",
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test test/*.test.ts",
+    "test:watch": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test --watch test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "doctor": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/cli.ts doctor"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.8.0"
+  },
+  "comments": {
+    "zeroRuntimeDeps": "There are intentionally NO runtime dependencies. Everything runs on Node 22 built-ins (fetch, node:test, node:child_process, TypeScript type-stripping). `npm test` works on a fresh clone with no install step.",
+    "devDependencies": "Only needed for `npm run typecheck` / editor IntelliSense. Safe to omit."
+  }
+}

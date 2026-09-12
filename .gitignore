@@ -1,0 +1,21 @@
+# Runtime state. Everything the harness records about *you* lives here and is
+# intentionally never committed. See docs/privacy.md.
+var/
+
+# Local secrets (never commit). Prefer environment variables.
+secrets.json
+
+# Training artifacts
+*.gguf
+*.safetensors
+adapters/
+outbox/
+
+# Node / editor
+node_modules/
+dist/
+.DS_Store
+*.log
+.venv/
+__pycache__/
+*.pyc

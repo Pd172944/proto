@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# proto — entrypoint shim.
+#
+# Runs the harness with Node's native TypeScript type-stripping so there is no
+# build step and no node_modules. Requires Node >= 22.6.
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "proto: node not found on PATH. Install Node >= 22.6 (e.g. 'brew install node')." >&2
+  exit 127
+fi
+
+NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+NODE_MINOR="$(node -p 'process.versions.node.split(".")[1]')"
+if [ "$NODE_MAJOR" -lt 22 ] || { [ "$NODE_MAJOR" -eq 22 ] && [ "$NODE_MINOR" -lt 6 ]; }; then
+  echo "proto: Node >= 22.6 required for native TypeScript execution (found $(node -v))." >&2
+  exit 1
+fi
+
+exec node --experimental-strip-types --disable-warning=ExperimentalWarning "$ROOT/src/cli.ts" "$@"
