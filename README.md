@@ -63,6 +63,7 @@ inspect decisions before configuring anything:
 ./bin/proto route "Fix the off-by-one error in this loop so it does not go out of bounds" --explain
 ./bin/proto eval run          # score the router on the built-in 22-task corpus
 ./bin/proto eval compare      # heuristic vs learned vs hybrid
+./bin/proto simulate --tasks 2500     # model the learning curve (no model needed)
 ```
 
 Run the whole loop end to end against deterministic mock models — no network, no
@@ -249,6 +250,30 @@ Opt in when you want it:
 
 ---
 
+### How much does this actually learn?
+
+`proto simulate` answers that with a curve rather than a promise. It runs the
+**real** router and the **real** logistic-regression trainer over a synthetic user,
+with a simulated local model that has per-class quirks the heuristic cannot see.
+
+Measured over 2,500 simulated tasks with the shipped defaults:
+
+| | after ~100 tasks | after ~2,500 tasks |
+|---|---|---|
+| labelled local attempts | 68 | 1,647 |
+| deployed (hybrid) router AUC | 0.724 | 0.747 |
+| heuristic prior AUC | 0.676 | 0.676 |
+| SFT samples available for LoRA | 99 | 400 (capped) |
+| DPO preference pairs | 12 | 300 (capped) |
+
+Read it this way: the **router** starts adapting after roughly 100 tasks and buys a
+real but modest gain — it learns *your* task mix and your model's quirks. The
+**LoRA** half remains a nudge at any realistic volume, and the dataset caps bind
+before it becomes more than that. A wrong-but-accepted answer rate of ~3.5% is the
+honest cost of routing to a cheap model, which is why `verify.runTests` matters.
+Full analysis, including the trainer bug the curve exposed, is in
+[docs/rl-design.md](docs/rl-design.md).
+
 ## Privacy and consent
 
 Three **independent** decisions, all off by default:
@@ -291,6 +316,7 @@ what this design does not protect against.
 | `proto train status\|tick\|now\|plan\|enable\|disable\|router\|adapters\|install-agent` | the deferred RL machinery |
 | `proto eval run\|compare\|list` | score routing offline against the corpus |
 | `proto replay [--mode …] [--floor n]` | re-score history under a different policy; no model calls |
+| `proto simulate [--tasks n] [--sweep] [--adaptive]` | model the learning curve: how many tasks until it measurably improves |
 | `proto contrib status\|preview\|stage\|upload\|consent\|outbox\|rotate` | the opt-in sharing channel |
 
 Every command supports `--json`. Add `--help` to any of them.
@@ -342,7 +368,7 @@ src/
   contrib/        consent records, bundle construction, outbox, upload
   eval/           task corpus, routing metrics, counterfactual replay
   util/           logging, argv, text, hashing, atomic fs, process helpers
-test/             229 tests, no network, no hardware required
+test/             247 tests, no network, no hardware required
 docs/             routing.md · rl-design.md · local-models.md · privacy.md
 scripts/          bootstrap-local.sh (dry-run default) · nightly-tick.sh
 ```
@@ -422,7 +448,7 @@ held-out slice, and decontamination checks on contributed data.
 ## Development
 
 ```bash
-npm test            # 229 tests, no network or hardware required
+npm test            # 247 tests, no network or hardware required
 npm run typecheck   # requires typescript installed (devDependency, optional)
 npm run doctor
 PROTO_LOG=debug ./bin/proto run "..." --mock

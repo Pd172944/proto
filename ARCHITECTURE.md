@@ -57,6 +57,7 @@ cli  ──►  harness ──►  verify ──┐
 | `harness` | prompt construction, the agent loop, escalation | decide policy (that is the router's job) |
 | `train` | scheduler gates, MLX driver, jobs, adapters | install packages or download models |
 | `eval` | corpus, metrics, counterfactual replay | spend money or mutate state |
+| `simulate` | synthetic users, ground-truth competence, learning-curve reporting | write to the real episode log or the real weights |
 | `contrib` | consent, bundles, outbox, upload | upload without three independent opt-ins |
 
 ### `Provider`
@@ -223,7 +224,7 @@ detail string for both outcomes; `proto train status` prints them verbatim.
 
 ## 8. Testing strategy
 
-`npm test` runs 229 tests in ~1.5 s with no network, no hardware, and no local
+`npm test` runs 247 tests in ~1.5 s with no network, no hardware, and no local
 runtime. Test files mirror modules:
 
 | File | Protects |
@@ -236,6 +237,7 @@ runtime. Test files mirror modules:
 | `harness.test.ts` | dry runs write nothing; apply writes only verified output; outage ≠ failure |
 | `eval.test.ts` | corpus score regression guard; hard tasks never routed local |
 | `contrib.test.ts` | consent gating, no text by default, dedup, no automatic upload |
+| `simulate.test.ts` | the learning curve never degrades with more data; simulations cannot touch real state |
 | `util.test.ts` | argv errors on unknown flags; config merge, env overrides, pricing |
 
 Two deliberate properties of the suite:

@@ -21,6 +21,8 @@ import {
 } from '../train/index.ts';
 import { listAdapters, getActiveAdapter } from '../train/adapter.ts';
 import { buildDatasets, describeDatasets } from '../memory/datasets.ts';
+import { formatSimulationReport, simulate } from '../simulate/index.ts';
+import type { Competence } from '../simulate/index.ts';
 import { EpisodeStore } from '../memory/store.ts';
 import { evaluateRouting, formatEvalReport, formatReplayReport, replay, EVAL_TASKS } from '../eval/index.ts';
 import { logisticEvalFromEpisodes, localSuccessByClass } from '../eval/metrics.ts';
@@ -438,6 +440,79 @@ const replayCommand: Command = {
 };
 
 /* ------------------------------------------------------------------ */
+/* simulate                                                           */
+/* ------------------------------------------------------------------ */
+
+const simulateCommand: Command = {
+  name: 'simulate',
+  summary: 'model the learning curve: how many tasks until the router and the local model measurably improve',
+  usage: 'proto simulate [--tasks n] [--competence realistic|pessimistic|optimistic] [--adaptive] [--seed n]',
+  flags: [
+    { name: 'tasks', type: 'number', description: 'how many tasks the simulated user performs', default: 400 },
+    { name: 'competence', type: 'string', description: 'pessimistic | realistic | optimistic (shifts simulated local-model skill)', default: 'realistic' },
+    { name: 'checkpoints', type: 'string', description: 'comma-separated task counts to report at' },
+    { name: 'seed', type: 'number', description: 'PRNG seed for reproducibility', default: 20250601 },
+    { name: 'adaptive', type: 'boolean', description: 'let the learned router drive routing once trained (shows the flywheel)' },
+    { name: 'verifier-catch', type: 'number', description: 'probability the verifier catches a wrong answer', default: 0.85 },
+    { name: 'cloud-success', type: 'number', description: 'probability the cloud model fixes what local failed', default: 0.9 },
+    { name: 'sweep', type: 'boolean', description: 'run pessimistic, realistic and optimistic in one go' },
+  ],
+  async run(ctx): Promise<CommandResult> {
+    const tasks = flagNumber(ctx.args, 'tasks') ?? 400;
+    const seed = flagNumber(ctx.args, 'seed') ?? 20250601;
+    const checkpointsRaw = flagString(ctx.args, 'checkpoints');
+    const checkpoints = checkpointsRaw
+      ? checkpointsRaw.split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0)
+      : undefined;
+
+    const competenceArg = (flagString(ctx.args, 'competence') ?? 'realistic') as Competence;
+    if (!['pessimistic', 'realistic', 'optimistic'].includes(competenceArg)) {
+      throw new Error('--competence must be pessimistic, realistic or optimistic');
+    }
+
+    const baseOpts = {
+      tasks,
+      seed,
+      ...(checkpoints ? { checkpoints } : {}),
+      verifierCatchRate: flagNumber(ctx.args, 'verifier-catch') ?? 0.85,
+      cloudSuccessRate: flagNumber(ctx.args, 'cloud-success') ?? 0.9,
+      adaptive: flagBool(ctx.args, 'adaptive'),
+    };
+
+    const human: string[] = [];
+    if (flagBool(ctx.args, 'sweep')) {
+      const results = (['pessimistic', 'realistic', 'optimistic'] as Competence[]).map((competence) =>
+        simulate(ctx.cfg, ctx.dataDir, { ...baseOpts, competence }),
+      );
+      human.push(style.bold('learning-curve sweep'));
+      human.push('');
+      human.push('  competence    tasks  labels  routerAUC  heurAUC  gain    routeAcc  sft  dpo  firstTrain  markedImpact');
+      for (const r of results) {
+        const last = r.checkpoints[r.checkpoints.length - 1];
+        human.push(
+          `  ${r.options.competence.padEnd(12)}  ${String(r.options.tasks).padStart(5)}  ` +
+            `${String(last?.labels ?? 0).padStart(6)}  ` +
+            `${(last?.hybridAuc === null || last?.hybridAuc === undefined ? '-' : last.hybridAuc.toFixed(3)).padStart(9)}  ` +
+            `${(last?.heuristicAuc ?? 0).toFixed(3).padStart(7)}  ` +
+            `${(last?.deployedGainOverHeuristic === null || last?.deployedGainOverHeuristic === undefined ? '-' : last.deployedGainOverHeuristic.toFixed(3)).padStart(6)}  ` +
+            `${(last?.hybridRoutingAccuracy === null || last?.hybridRoutingAccuracy === undefined ? '-' : `${(last.hybridRoutingAccuracy * 100).toFixed(1)}%`).padStart(8)}  ` +
+            `${String(last?.sftSamples ?? 0).padStart(3)}  ${String(last?.dpoPairs ?? 0).padStart(3)}  ` +
+            `${String(r.firstTrainingAt ?? '-').padStart(10)}  ${String(r.markedImpactAt ?? '-').padStart(12)}`,
+        );
+      }
+      human.push('');
+      human.push('the three rows differ only in the assumed skill of the simulated local model;');
+      human.push('the router learning curve comes from the real trainer, so compare the shapes.');
+      for (const line of results[1]?.notes ?? []) human.push(`  note: ${line}`);
+      return { human, json: { ok: true, results } };
+    }
+
+    const result = simulate(ctx.cfg, ctx.dataDir, { ...baseOpts, competence: competenceArg });
+    return { human: formatSimulationReport(result), json: { ok: true, result } };
+  },
+};
+
+/* ------------------------------------------------------------------ */
 /* contrib                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -590,4 +665,4 @@ const contrib: Command = {
   },
 };
 
-export const learningCommands: Command[] = [train, evalCommand, replayCommand, contrib];
+export const learningCommands: Command[] = [train, evalCommand, replayCommand, simulateCommand, contrib];

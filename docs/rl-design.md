@@ -387,7 +387,89 @@ Choosing not to hide this is deliberate: *"a harness that claims 'we fine-tuned 
 but leaves it invisible to the runtime the user actually uses is worse than one that
 explains the two options."*
 
-## 10. Roadmap: deliberately not implemented
+## 10. Simulating the learning curve
+
+"How many tasks before this is meaningfully better than the downloaded base model?"
+cannot be answered by reading code, so `proto simulate` answers it with a curve.
+
+```bash
+proto simulate --tasks 400                       # the default scenario
+proto simulate --tasks 2500 --adaptive           # long horizon, learned router drives routing
+proto simulate --sweep                           # pessimistic / realistic / optimistic side by side
+```
+
+**What is real:** the router, the 43-feature vector, the policy, the verifier
+plumbing, the dataset builder, and the actual logistic-regression trainer — all
+evaluated on a held-out set of 800 tasks with ground-truth labels (AUC, Brier, and
+routing accuracy at the deployed quality floor).
+
+**What is simulated:** the user (a stochastic draw from the task corpus, 65% small
+mechanical work) and the local model's competence.
+
+### The design decision that makes it informative
+
+The simulated local model does **not** simply get better at easy tasks. It has
+**per-class affinities** — drawn from a fixed seed and printed in the report — so
+it can be unusually good at `bugfix-local` (×1.28) and unusually bad at `explain`
+(×0.72) in a way its *difficulty* does not predict.
+
+If the synthetic labels were a pure function of difficulty, the heuristic prior
+would *be* the Bayes-optimal model, no amount of learning could beat it, and the
+exercise would prove nothing. Putting part of the truth outside the difficulty
+scale is what tests the project's actual claim: that the harness can discover
+which tasks *your* local model handles, from observation alone.
+
+### What the curve looks like
+
+Measured on an M-series laptop, default settings (`--tasks 2500`, exploration off):
+
+| tasks | labels | local% | true-ok | falsePass | SFT | DPO | hybrid AUC | learned AUC | heuristic AUC | hybrid routing acc |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 0 | 0% | – | – | 0 | 0 | – | – | 0.676 | – |
+| 100 | 68 | 68% | 77.9% | 2.9% | 99 | 12 | 0.724 | 0.644 | 0.676 | 72.4% |
+| 250 | 168 | 67% | 74.4% | 3.6% | 247 | 37 | 0.738 | 0.632 | 0.676 | 69.4% |
+| 1000 | 650 | 65% | 76.9% | 3.1% | 400 | 145 | 0.739 | 0.589 | 0.676 | 70.1% |
+| 2000 | 1318 | 66% | 76.2% | 3.8% | 400 | 295 | 0.746 | 0.592 | 0.676 | 73.1% |
+| 2500 | 1647 | 66% | 77.1% | 3.5% | 400 | 300 | 0.747 | 0.607 | 0.676 | 73.1% |
+
+### How to read that honestly
+
+1. **The router starts learning after roughly 100 tasks.** The gate is 40 *labelled*
+   local attempts, and at a ~66% local routing rate that is ~60 tasks of real work
+   before the first training run. Below that the system runs purely on the
+   heuristic prior.
+2. **The prior is strong and the learned scorer does not beat it.** Raw learned AUC
+   sits at 0.59–0.64 against the heuristic's 0.676, even with 1,647 labels. The
+   *deployed* default is hybrid — the learned score shrunk toward the prior — and
+   that is what reaches 0.72–0.75, i.e. a genuine but modest +0.07 AUC. This is
+   precisely why `blendWithPrior` caps the learned weight at 0.85, and it is worth
+   knowing before assuming "more of my own data" solves routing.
+3. **Routing accuracy reaches parity, not superiority, at ~2,000 tasks** (73.1% vs
+   73.1%). It is a few points better than the prior at 100 tasks and roughly equal
+   thereafter. The measurable win from the fast loop is *adaptation to your task
+   mix*, not a dramatic accuracy jump.
+4. **The dataset caps bind before the learning is interesting.** SFT saturates at
+   its 400-sample cap by ~500 tasks and DPO at 300 by ~2,500. If you want the slow
+   loop to matter, raise `--max-sft` / `--max-dpo` on `datasets build` and raise
+   `train.lora.iters`; the shipped defaults are sized for a laptop nudge, not a
+   real fine-tune.
+5. **The verifier's error rate is the cost of the whole design.** ~3.5% of local
+   attempts were wrong *and accepted*. That number is the reason
+   `routing.qualityFloorUnverified` is 0.90 and the reason to enable
+   `verify.runTests` on code you care about.
+
+### A bug this found
+
+The first long-horizon run showed the learned scorer getting *worse* as the log
+grew (AUC 0.65 → 0.51 from 68 to 1,647 labels). The cause was in the trainer, not
+the simulation: per-sample SGD accumulated gradients over the whole dataset without
+normalising by its size, so the effective step size grew linearly with the number
+of episodes and training oscillated at scale. `trainLogistic` now does full-batch
+gradient descent on the *mean* weighted loss, which makes the learning rate, the
+L2 strength and the convergence behaviour independent of dataset size — and makes
+training deterministic. `test/simulate.test.ts` guards the regression.
+
+## 11. Roadmap: deliberately not implemented
 
 1. **GRPO or any group-relative method using per-token logprobs.** The config already
    carries `local.requestLogprobs` (default `false`) as the hook, but nothing reads it

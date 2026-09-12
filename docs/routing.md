@@ -595,6 +595,19 @@ regression test now.
   discussion) pulled tasks into `security`; bare `uuid` pulled them into `migration`; and
   `hasSecurityLanguage` matched a bare `token`, so "add a null check before using the token"
   was one noun away from a hard lock. All three are tightened, with regression tests.
+- **The learned scorer degraded as the log grew.** Per-sample SGD accumulated the
+  gradient over the whole dataset without dividing by its size, so the effective
+  step size scaled with the number of episodes and training oscillated once a user
+  had a few hundred. Held-out AUC fell from 0.65 to 0.51 between 68 and 1,647
+  labels — the opposite of the point. `trainLogistic` now does full-batch gradient
+  descent on the mean weighted loss, making the learning rate, the L2 strength and
+  the convergence independent of dataset size (and the result deterministic). A
+  simulation of the learning curve found it; `test/simulate.test.ts` guards it.
+- **Class balancing distorted the probability scale.** `balanceClasses` defaulted
+  to `true`, which rescales the output so it is no longer a probability — but
+  `policy.ts` compares it against a probability floor and `blendWithPrior` averages
+  it with a calibrated prior. The simulation showed a higher AUC producing *worse*
+  routing decisions. It now defaults to `false`, documented in `TrainOptions`.
 - **A configured API key did not enable the cloud tier.** `resolveApiKeyFor()` read
   `cfg.dataDir` with `??`, and an empty string is not nullish, so while `loadConfig()` still
   had `dataDir` as `""` the secrets lookup resolved to `join("", "secrets.json")` — relative to

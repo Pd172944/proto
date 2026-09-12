@@ -44,7 +44,22 @@ export interface TrainOptions {
   epochs?: number;
   learningRate?: number;
   l2?: number;
-  /** Balance positive/negative classes; important because local mostly succeeds. */
+  /**
+   * Reweight positives and negatives to equal total mass.
+   *
+   * Off by default, and that default matters. Balancing rescales the output so it
+   * is no longer a probability: the score stops meaning "the chance local
+   * succeeds" and starts meaning "a balanced-score statistic". Two consumers
+   * depend on the probability reading:
+   *   - `policy.ts` compares the score against a probability floor (0.72 / 0.90 /
+   *     0.55), so a rescaled score silently shifts the effective threshold;
+   *   - `heuristic.ts::blendWithPrior` averages it with the heuristic prior,
+   *     which *is* calibrated, so mixing two scales produces a meaningless number.
+   * A simulation of the learning curve showed exactly this: the balanced model had
+   * a higher AUC yet produced worse routing decisions than the prior. Leave this
+   * off unless you are deliberately training a ranker and will calibrate it
+   * (Platt/isotonic) before it reaches the policy.
+   */
   balanceClasses?: boolean;
   seed?: number;
 }
@@ -71,16 +86,6 @@ export interface RouterWeights {
   notes: string[];
 }
 
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
 
 export class LogisticScorer {
   weights: number[];
@@ -144,18 +149,19 @@ export class LogisticScorer {
 /**
  * Train by mini-batch SGD with L2 and class balancing.
  *
- * Deterministic given a seed, so `proto train router` produces reproducible
- * weights and the eval harness can compare runs meaningfully.
+ * Fully deterministic: full-batch gradient descent with no shuffling, so
+ * `proto train router` produces bit-identical weights for the same data and the
+ * eval harness can compare runs meaningfully. (`opts.seed` is accepted for API
+ * compatibility and no longer influences the result.)
  */
 export function trainLogistic(
   samples: TrainingSample[],
   opts: TrainOptions = {},
 ): { scorer: LogisticScorer; metrics: TrainingMetrics } {
   const epochs = opts.epochs ?? 300;
-  const lr = opts.learningRate ?? 0.08;
-  const l2 = opts.l2 ?? 0.01;
-  const balance = opts.balanceClasses ?? true;
-  const rand = mulberry32(opts.seed ?? 12345);
+  const lr = opts.learningRate ?? 0.5;
+  const l2 = opts.l2 ?? 0.02;
+  const balance = opts.balanceClasses ?? false;
   const d = FEATURE_NAMES.length;
 
   if (samples.length === 0) {
@@ -175,28 +181,48 @@ export function trainLogistic(
   const weights = new Array(d).fill(0);
   weights[0] = Math.log((positives + 1) / (negatives + 1));
 
-  const order = samples.map((_, i) => i);
+  /*
+   * Full-batch gradient descent on the *mean* weighted loss.
+   *
+   * The previous implementation was per-sample SGD that accumulated the gradient
+   * over the whole dataset without normalising by its size, so the effective step
+   * size grew linearly with the number of episodes: with 68 examples training
+   * behaved, and with 1600 it oscillated. The learned scorer therefore got WORSE
+   * as the user's log grew — the exact opposite of the point — which a
+   * learning-curve simulation surfaced (held-out AUC fell from 0.65 to 0.51 as
+   * labels went from 68 to 1647).
+   *
+   * Dividing by the total weight makes the gradient a proper mean, which makes the
+   * learning rate, the L2 strength and the convergence behaviour all independent
+   * of dataset size. It is also deterministic, so `seed` no longer affects the
+   * result; the parameter is kept for API compatibility.
+   *
+   * Cost: `epochs x n x d` multiply-adds. At 43 features and a few thousand rows
+   * that is a handful of milliseconds, which is what makes the fast loop free.
+   */
+  const grad = new Array<number>(d).fill(0);
+
   for (let epoch = 0; epoch < epochs; epoch++) {
-    // Fisher-Yates with the seeded PRNG for determinism.
-    for (let i = order.length - 1; i > 0; i--) {
-      const j = Math.floor(rand() * (i + 1));
-      const a = order[i] as number;
-      order[i] = order[j] as number;
-      order[j] = a;
-    }
-    const epochLr = lr / (1 + epoch / (epochs * 0.75));
-    for (const idx of order) {
-      const s = samples[idx] as TrainingSample;
-      const y = s.y;
-      const cw = (y === 1 ? posWeight : negWeight) * (s.w ?? 1);
+    grad.fill(0);
+    let totalWeight = 0;
+
+    for (const s of samples) {
+      const cw = (s.y === 1 ? posWeight : negWeight) * (s.w ?? 1);
       let z = 0;
       for (let k = 0; k < d; k++) z += (weights[k] as number) * (s.x[k] ?? 0);
-      const p = sigmoid(z);
-      const g = (p - y) * cw;
-      for (let k = 0; k < d; k++) {
-        const reg = k === 0 ? 0 : l2 * (weights[k] as number); // never regularise the bias
-        weights[k] = (weights[k] as number) - epochLr * (g * (s.x[k] ?? 0) + reg);
-      }
+      const g = (sigmoid(z) - s.y) * cw;
+      for (let k = 0; k < d; k++) grad[k] = (grad[k] as number) + g * (s.x[k] ?? 0);
+      totalWeight += cw;
+    }
+
+    if (totalWeight <= 0) break;
+    // Decay the step size over the run for a smoother finish.
+    const step = lr / (1 + epoch / (epochs * 0.5));
+
+    for (let k = 0; k < d; k++) {
+      // Never regularise the bias: it carries the class prior, not a hypothesis.
+      const reg = k === 0 ? 0 : l2 * (weights[k] as number);
+      weights[k] = (weights[k] as number) - step * ((grad[k] as number) / totalWeight + reg);
     }
   }
 
