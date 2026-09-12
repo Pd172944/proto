@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# Launcher for the interactive coding agent. Symlink this onto your PATH so that
-# `cd anywhere && proto-code` starts a session rooted in that directory, the same
-# way other coding agents work.
+# Launcher for the interactive coding agent.
+#
+# Symlink this onto your PATH so that `cd anywhere && proto-code` starts a session
+# rooted in that directory, the same way other coding agents work:
+#
+#   mkdir -p ~/.local/bin
+#   ln -sf /path/to/proto/bin/proto-code ~/.local/bin/proto-code
+#
+# The launcher resolves its own location — following symlinks — so it works when
+# invoked from a symlink, from a relative path, and from an absolute path.
 set -euo pipefail
 
 SOURCE="${BASH_SOURCE[0]}"
@@ -10,6 +17,22 @@ while [ -L "$SOURCE" ]; do
   SOURCE="$(readlink "$SOURCE")"
   [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
 done
-ROOT="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+# This file lives in <repo>/bin/, so the repository root is ONE LEVEL UP. Getting
+# this wrong is invisible to `bash -n` and only appears at runtime as a Node
+# MODULE_NOT_FOUND, which is why test/cli.test.ts actually executes this script.
+ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+ENTRY="$ROOT/src/cli.ts"
 
-exec node --experimental-strip-types --disable-warning=ExperimentalWarning "$ROOT/src/cli.ts" code "$@"
+if [ ! -f "$ENTRY" ]; then
+  echo "proto-code: cannot find $ENTRY" >&2
+  echo "            (resolved repository root: $ROOT)" >&2
+  echo "            the launcher expects to live in <repo>/bin/; is the symlink broken?" >&2
+  exit 1
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "proto-code: node not found on PATH. Install Node >= 22.6 (e.g. 'brew install node')." >&2
+  exit 127
+fi
+
+exec node --experimental-strip-types --disable-warning=ExperimentalWarning "$ENTRY" code "$@"

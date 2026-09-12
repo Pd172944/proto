@@ -15,6 +15,8 @@ import { promisify } from 'node:util';
 
 import { tempDir } from './helpers.ts';
 import { writeJsonAtomic } from '../src/util/fsx.ts';
+import { symlinkSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
 
 const run = promisify(execFile);
 const REPO = new URL('..', import.meta.url).pathname;
@@ -57,6 +59,75 @@ async function cli(
     return { code: typeof e.code === 'number' ? e.code : 1, stdout: e.stdout ?? '', stderr: e.stderr ?? '' };
   }
 }
+
+describe('cli: launchers actually execute', () => {
+  /**
+   * These tests exist because of a real bug: `bin/proto-code` computed the repository
+   * root as `<repo>/bin` instead of `<repo>`, so it looked for `<repo>/bin/src/cli.ts`
+   * and died with a Node MODULE_NOT_FOUND.
+   *
+   * `bash -n` cannot catch that — it is syntactically valid — and the mistake is
+   * invisible when the script is run from inside the repo, which is why the bug
+   * survived until a user tried it from a different directory. Hence: execute the real
+   * scripts, from a directory that is not the repo, and through a symlink.
+   */
+  const runLauncher = async (script: string, args: string[], opts: { cwd: string }): Promise<CliResult> => {
+    // `join(REPO, absolutePath)` would silently mangle an absolute path into
+    // REPO + path, which is how this helper first "failed" the symlink case.
+    const full = isAbsolute(script) ? script : join(REPO, script);
+    try {
+      const { stdout, stderr } = await run(full, args, {
+        cwd: opts.cwd,
+        env: { ...process.env, PROTO_HOME: tempDir(), PROTO_LOG: 'silent', NO_COLOR: '1' },
+        timeout: 60_000,
+        maxBuffer: 4 * 1024 * 1024,
+      });
+      return { code: 0, stdout, stderr };
+    } catch (err) {
+      const e = err as { code?: number; stdout?: string; stderr?: string };
+      return { code: typeof e.code === 'number' ? e.code : 1, stdout: e.stdout ?? '', stderr: e.stderr ?? '' };
+    }
+  };
+
+  it('bin/proto works when invoked by absolute path from an unrelated directory', async () => {
+    // This is the invocation that broke: cwd has nothing to do with the repo.
+    const res = await runLauncher('bin/proto', ['help'], { cwd: tempDir() });
+    assert.equal(res.code, 0, res.stderr);
+    assert.match(res.stdout, /two-regime coding harness|usage: proto/);
+  });
+
+  it('bin/proto-code works when invoked by absolute path from an unrelated directory', async () => {
+    const res = await runLauncher('bin/proto-code', ['--help'], { cwd: tempDir() });
+    assert.equal(res.code, 0, res.stderr);
+    assert.match(res.stdout, /interactive coding agent/);
+  });
+
+  it('bin/proto-code works through a symlink on PATH', async () => {
+    // The documented install pattern, and the one that exercises the launcher's
+    // symlink-following loop.
+    const bin = tempDir();
+    const link = join(bin, 'proto-code');
+    symlinkSync(join(REPO, 'bin', 'proto-code'), link);
+    const res = await runLauncher(link, ['--help'], { cwd: tempDir() });
+    assert.equal(res.code, 0, res.stderr);
+    assert.match(res.stdout, /interactive coding agent/);
+  });
+
+  it('bin/proto-code resolves its root correctly from a relative invocation', async () => {
+    const res = await runLauncher('bin/proto-code', ['--help'], { cwd: REPO });
+    assert.equal(res.code, 0, res.stderr);
+    assert.match(res.stdout, /interactive coding agent/);
+  });
+
+  it('both launchers are executable and carry a shebang', async () => {
+    const { readFileSync, statSync } = await import('node:fs');
+    for (const script of ['bin/proto', 'bin/proto-code']) {
+      const full = join(REPO, script);
+      assert.match(readFileSync(full, 'utf8').split('\n')[0] ?? '', /^#!.*bash/, `${script} needs a bash shebang`);
+      assert.ok((statSync(full).mode & 0o111) !== 0, `${script} must be executable (chmod +x)`);
+    }
+  });
+});
 
 describe('cli: basics', () => {
   it('prints help and exits 0', async () => {
