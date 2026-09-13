@@ -25,7 +25,7 @@ import type { CodeGraph } from './graph.ts';
 import { extract, maskSource } from './lang.ts';
 import { renderFileOutline, renderRepoMap } from './repomap.ts';
 import { referringFiles } from './graph.ts';
-import { isLiteralPattern, scanFiles, searchWithGit } from './search.ts';
+import { isLiteralPattern, normalizeSearchPattern, scanFiles, searchWithGit } from './search.ts';
 import type { SearchOptions, SearchOutcome } from './search.ts';
 import { cacheSize, loadIndex, saveIndex } from './store.ts';
 import { discoverFiles } from './walk.ts';
@@ -332,14 +332,15 @@ export class CodebaseIndex {
    * falls through to a bounded scan, which is allowed to return "no matches".
    */
   search(opts: SearchOptions): SearchOutcome {
-    const git = searchWithGit(this.root, opts);
+    const normalized: SearchOptions = { ...opts, pattern: normalizeSearchPattern(opts.pattern) };
+    const git = searchWithGit(this.root, normalized);
     if (git !== null) {
-      if (git.hits.length > 0 || isLiteralPattern(opts.pattern)) return git;
+      if (git.hits.length > 0 || isLiteralPattern(normalized.pattern)) return git;
       // Empty shortlist for a regex: verify before reporting absence.
     }
 
-    const candidates = this.candidatePaths(opts);
-    const scanned = scanFiles(this.root, candidates, opts, 'scan');
+    const candidates = this.candidatePaths(normalized);
+    const scanned = scanFiles(this.root, candidates, normalized, 'scan');
     return scanned;
   }
 

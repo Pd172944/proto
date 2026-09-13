@@ -61,6 +61,20 @@ const DEFAULT_MAX_RESULTS = 80;
 const DEFAULT_MAX_FILES = 5000;
 const DEFAULT_MAX_LINE = 240;
 
+/**
+ * Strip `/pattern/`-style delimiters models copy from JavaScript regex literals.
+ *
+ * The search tool asks for a JavaScript regex *string*. Models still pass
+ * `/stack/` (or `/stack/i`), which would otherwise look for the literal slashes
+ * and return zero matches in a Python repository.
+ */
+export function normalizeSearchPattern(pattern: string): string {
+  const trimmed: string = pattern.trim();
+  const wrapped: RegExpMatchArray | null = trimmed.match(/^\/(.+)\/([gimsuy]*)$/);
+  if (wrapped && wrapped[1] !== undefined && wrapped[1] !== '') return wrapped[1];
+  return trimmed;
+}
+
 /** True when the pattern contains nothing a regex engine would treat specially. */
 export function isLiteralPattern(pattern: string): boolean {
   return !/[.*+?^${}()|[\]\\]/.test(pattern);
@@ -114,9 +128,12 @@ export function searchWithGit(root: string, opts: SearchOptions): SearchOutcome 
   if (!opts.caseSensitive) base.push('-i');
 
   if (literal) {
-    // `-m` stops per file, so one pathological file cannot consume the whole budget.
-    const args = [...base, '-F', '-m', String(Math.max(1, Math.min(max, 200))), '-e', opts.pattern];
-    const out = run(args, root);
+    // `-m` stops per file on newer git. Older builds (this machine's) reject it
+    // with exit 129; treating that as "no matches" made every search return empty.
+    const cap: string = String(Math.max(1, Math.min(max, 200)));
+    const out: string | null =
+      run([...base, '-F', '-m', cap, '-e', opts.pattern], root) ??
+      run([...base, '-F', '-e', opts.pattern], root);
     if (out === null) return null;
     const hits = parseGrepOutput(out, opts);
     return { hits, engine: 'git-grep', filesScanned: 0, truncated: hits.length >= max };

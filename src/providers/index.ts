@@ -121,7 +121,7 @@ export function buildLocalProvider(cfg: ProtoConfig): Provider {
     capabilities: {
       contextWindow: cfg.local.contextWindow,
       maxOutputTokens: cfg.local.maxOutputTokens,
-      tools: cfg.local.runtime !== 'llamacpp',
+      tools: true,
       jsonSchema: cfg.local.runtime === 'mlx',
       streaming: false,
     },

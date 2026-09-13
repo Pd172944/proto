@@ -31,6 +31,7 @@ import type { Tool, ToolContext, ToolRegistry, ToolResult } from '../tools/types
 import type { CodebaseIndex } from '../index/index.ts';
 import { buildSystemPrompt, gatherProjectContext, looksLikeVerification, turnReminder } from './prompt.ts';
 import type { ProjectContext, TurnState } from './prompt.ts';
+import { compactMessages, estimateTokens } from './compact.ts';
 import { HARNESS_VERSION } from '../version.ts';
 
 /* ------------------------------------------------------------------ */
@@ -49,6 +50,7 @@ export type AgentEvent =
   | { type: 'reminder'; text: string }
   | { type: 'notice'; level: 'info' | 'warn' | 'error'; text: string }
   | { type: 'usage'; usage: { inputTokens: number; outputTokens: number; cachedInputTokens?: number }; costUsd: number }
+  | { type: 'compaction'; elided: number; dropped: number; tokens: number }
   | { type: 'done'; reason: 'complete' | 'max-steps' | 'deadline' | 'aborted' | 'error'; steps: number; text: string };
 
 export interface AgentResult {
@@ -88,6 +90,13 @@ export interface AgentOptions {
   interactive?: boolean;
   maxToolOutputChars?: number;
   /**
+   * Approximate context window of the model, in tokens. When the transcript
+   * approaches it, older tool outputs are elided and, if necessary, whole
+   * early rounds are dropped (see `compact.ts`). Unset means "large" (no
+   * compaction below ~180k tokens).
+   */
+  contextTokens?: number;
+  /**
    * Codebase index for this workspace. When present, the repository tools can answer
    * `repo_map` / `find_symbol` / `find_references`, and `search` narrows through it.
    * Optional: the loop works without one, just more expensively.
@@ -106,7 +115,17 @@ export interface AgentOptions {
 export async function runAgentTurn(opts: AgentOptions): Promise<AgentResult> {
   const onEvent = opts.onEvent ?? ((): void => {});
   const maxSteps = opts.maxSteps ?? 40;
-  const deadline = Date.now() + (opts.deadlineMs ?? 10 * 60_000);
+  const deadlineMs = opts.deadlineMs ?? 10 * 60_000;
+  const deadline = Date.now() + deadlineMs;
+  // A hard abort so a hung local HTTP call cannot outlive the turn budget
+  // (the per-step check below only runs *between* model calls).
+  const turnAbort = new AbortController();
+  const deadlineTimer = setTimeout(() => turnAbort.abort(), deadlineMs);
+  if (opts.signal) {
+    if (opts.signal.aborted) turnAbort.abort();
+    else opts.signal.addEventListener('abort', () => turnAbort.abort(), { once: true });
+  }
+  const signal = turnAbort.signal;
   const interactive = opts.interactive ?? true;
   const maxToolOutputChars = opts.maxToolOutputChars ?? 24_000;
 
@@ -137,7 +156,7 @@ export async function runAgentTurn(opts: AgentOptions): Promise<AgentResult> {
   for (let step = 1; step <= maxSteps; step++) {
     steps = step;
 
-    if (opts.signal?.aborted) {
+    if (signal.aborted) {
       reason = 'aborted';
       break;
     }
@@ -157,6 +176,19 @@ export async function runAgentTurn(opts: AgentOptions): Promise<AgentResult> {
       }
     }
 
+    // Keep the transcript inside the model's context window. The budget leaves
+    // room for the model's own output plus a safety margin for tokenizer drift
+    // between our estimate and the provider's count.
+    const contextTokens = opts.contextTokens ?? 200_000;
+    const budget = Math.max(4_000, contextTokens - (opts.maxOutputTokens ?? 8192) - Math.round(contextTokens * 0.1));
+    if (estimateTokens(messages) > budget) {
+      const compacted = compactMessages(messages, { budgetTokens: budget });
+      if (compacted.changed) {
+        messages.splice(0, messages.length, ...compacted.messages);
+        onEvent({ type: 'compaction', elided: compacted.elided, dropped: compacted.dropped, tokens: compacted.tokens });
+      }
+    }
+
     onEvent({ type: 'model-start', step });
 
     const request: ChatRequest = {
@@ -164,7 +196,7 @@ export async function runAgentTurn(opts: AgentOptions): Promise<AgentResult> {
       tools: opts.tools.specs(),
       maxTokens: opts.maxOutputTokens ?? 8192,
       temperature: opts.temperature ?? 0.2,
-      ...(opts.signal ? { signal: opts.signal } : {}),
+      signal,
       meta: { agentStep: step },
     };
 
@@ -247,7 +279,7 @@ export async function runAgentTurn(opts: AgentOptions): Promise<AgentResult> {
           onEvent({ type: 'approval', title: req.title, decision });
           return decision;
         },
-        ...(opts.signal ? { signal: opts.signal } : {}),
+        signal,
       };
 
       let result: ToolResult;
@@ -263,6 +295,10 @@ export async function runAgentTurn(opts: AgentOptions): Promise<AgentResult> {
 
       if (result.ok && (tool.name === 'edit_file' || tool.name === 'write_file')) {
         for (const f of result.meta?.files ?? []) if (!state.edited.includes(f)) state.edited.push(f);
+      }
+      if (tool.name === 'search' || tool.name === 'find_symbol' || tool.name === 'find_references') {
+        const empty = result.ok && /→ 0 matches|\b0 match(es)?\b|no matches|not found/i.test(`${result.title}\n${result.output.slice(0, 200)}`);
+        state.fruitlessSearches = empty ? (state.fruitlessSearches ?? 0) + 1 : 0;
       }
       if (tool.name === 'run_command') {
         const command = typeof toolCall.args === 'object' && toolCall.args !== null
@@ -284,6 +320,7 @@ export async function runAgentTurn(opts: AgentOptions): Promise<AgentResult> {
 
   onEvent({ type: 'done', reason, steps, text: finalText });
 
+  clearTimeout(deadlineTimer);
   return {
     text: finalText,
     steps,

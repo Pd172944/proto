@@ -166,6 +166,7 @@ export interface Price {
  * is never treated as free.
  */
 export const DEFAULT_PRICING: Record<string, Price> = {
+  'thinkingmachines/inkling:free': { in: 0, out: 0 },
   'anthropic/claude-sonnet-4.5': { in: 3, out: 15, cachedIn: 0.3 },
   'claude-sonnet-4-5': { in: 3, out: 15, cachedIn: 0.3 },
   'claude-haiku-4-5': { in: 1, out: 5, cachedIn: 0.1 },

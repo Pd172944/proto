@@ -232,6 +232,12 @@ export interface TurnState {
   ranVerification: boolean;
   /** Consecutive turns with no tool call and no answer. */
   idleTurns: number;
+  /** How many verification reminders have already been injected this turn. */
+  verifyReminders?: number;
+  /** Consecutive `search`/`find_symbol` calls that returned no matches. */
+  fruitlessSearches?: number;
+  /** Whether the fruitless-search nudge has been injected this turn. */
+  searchNudged?: boolean;
 }
 
 const VERIFY_HINT = /\b(test|pytest|jest|vitest|typecheck|tsc|lint|eslint|ruff|mypy|cargo (test|check)|go (test|vet)|npm (test|run)|pnpm|yarn|make|gradle|mvn)\b/i;
@@ -247,11 +253,27 @@ export function looksLikeVerification(command: string): boolean {
  * turn learns to ignore the nags.
  */
 export function turnReminder(state: TurnState): string | null {
-  if (state.edited.length > 0 && !state.ranVerification && state.idleTurns === 0) {
+  // The verification reminder is injected at most twice: repeating the same
+  // nag before every model call teaches the model to ignore it and burns
+  // context on transcripts that are already long.
+  if (state.edited.length > 0 && !state.ranVerification && state.idleTurns === 0 && (state.verifyReminders ?? 0) < 2) {
+    state.verifyReminders = (state.verifyReminders ?? 0) + 1;
     return (
       `You edited ${state.edited.length} file(s) but have not run any tests, typechecker or linter. ` +
       `If the project has one, run it now and fix anything it reports. If it does not, say so explicitly ` +
       `instead of implying the change is verified.`
+    );
+  }
+  // A model that guesses symbol names produces long runs of zero-match
+  // searches — the observed failure mode on repo-scale tasks. One pointed
+  // nudge redirects it to structure-first navigation; repeating it would not.
+  if ((state.fruitlessSearches ?? 0) >= 3 && !state.searchNudged) {
+    state.searchNudged = true;
+    return (
+      `Your last ${state.fruitlessSearches} searches found nothing: you are guessing names that do not ` +
+      `exist in this codebase. Stop guessing. Use \`find_symbol\` for definitions, \`repo_map\` or ` +
+      `\`list_files\` to see what actually exists, \`file_outline\` on the most relevant file, and ` +
+      `read the code before searching again.`
     );
   }
   if (state.idleTurns >= 3 && state.edited.length === 0) {

@@ -97,6 +97,20 @@ export function heuristicScore(f: TaskFeatures): HeuristicScore {
     { feature: 'stacktrace', value: f.hasStackTrace ? -0.05 : 0, note: 'stack trace present' },
     { feature: 'externalApi', value: f.hasExternalApiMention ? 0.04 : 0, note: 'names a specific library/version (recall risk)' },
     { feature: 'loopLoad', value: 0.02 * loopLoad, note: `${f.loopCount} loop(s) in scope` },
+    {
+      // Repo-scale localization. An issue-style report — long prose, no files
+      // in scope — is not the bounded edit its class keywords suggest: before
+      // any fix, the model must *find* the change site in an unfamiliar
+      // codebase, and that search is where small models actually fail on
+      // SWE-bench-shaped work. Scales smoothly from 0 (short task) to full
+      // effect at ~3k chars of issue text.
+      feature: 'localization',
+      // Softened from 0.3: a named symbol plus a repro is often enough for the
+      // local model, and sending every issue-shaped task to the cloud wastes
+      // the free local tier we actually want to stress.
+      value: 0.16 * (f.fileCount === 0 ? clamp01((f.taskChars - 500) / 2500) : 0),
+      note: `issue-style task (${f.taskChars} chars) with no files in scope: the change site must be located first`,
+    },
   ];
 
   const rawDifficulty = parts.reduce((a, p) => a + p.value, 0);
@@ -137,6 +151,22 @@ export function heuristicScore(f: TaskFeatures): HeuristicScore {
   if (f.estInputTokens > 6000) {
     logit -= 0.5;
     extras.push({ feature: 'longContext', value: -0.5, note: `~${f.estInputTokens} input tokens strains a small context window` });
+  }
+  {
+    // The probability side of the localization contribution above: a long issue
+    // with no files in scope means multi-step repo navigation before the first
+    // edit, which compounds a small model's per-step error rate.
+    const issueScale = f.fileCount === 0 ? clamp01((f.taskChars - 500) / 2500) : 0;
+    if (issueScale > 0.2) {
+      const named = f.mentionsSpecificSymbol ? 0.45 : 1;
+      const penalty = -0.7 * issueScale * named;
+      logit += penalty;
+      extras.push({
+        feature: 'localizationLoad',
+        value: penalty,
+        note: 'issue-style task in an unseen codebase: locating the change compounds per-step error',
+      });
+    }
   }
   if (f.estOutputTokens > 1800) {
     logit -= 0.3;

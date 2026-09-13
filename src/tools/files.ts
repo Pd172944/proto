@@ -22,7 +22,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 
 import { discoverFiles } from '../index/walk.ts';
-import { scanFiles } from '../index/search.ts';
+import { normalizeSearchPattern, scanFiles } from '../index/search.ts';
 import { repoIndexTools } from './repo.ts';
 import { capOutput, resolveInsideWorkspace, ToolRegistry } from './types.ts';
 import type { Tool, ToolContext, ToolResult } from './types.ts';
@@ -201,7 +201,9 @@ export const searchTool: Tool = {
   risk: 'read',
   async run(args, ctx): Promise<ToolResult> {
     const started = Date.now();
-    const pattern = argString(args, 'pattern');
+    const rawPattern = argString(args, 'pattern');
+    if (!rawPattern) return { ok: false, title: 'search', output: 'pattern is required' };
+    const pattern: string = normalizeSearchPattern(rawPattern);
     if (!pattern) return { ok: false, title: 'search', output: 'pattern is required' };
 
     let re: RegExp;

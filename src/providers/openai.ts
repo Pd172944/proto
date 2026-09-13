@@ -96,10 +96,12 @@ export class OpenAICompatibleProvider implements Provider {
       ...(this.headerHook?.(req) ?? {}),
     };
     if (this.apiKey) headers['authorization'] = `Bearer ${this.apiKey}`;
-    // OpenRouter likes these for attribution; harmless elsewhere.
+    // OpenRouter uses these for attribution, and gates some models on the
+    // calling app's identity; overridable because the registered identity of
+    // a deployment is the deployer's decision, not this library's.
     if (this.baseUrl.includes('openrouter.ai')) {
-      headers['http-referer'] = 'https://github.com/proto-harness';
-      headers['x-title'] = 'proto-harness';
+      headers['http-referer'] = process.env['PROTO_OR_REFERER'] ?? 'https://github.com/proto-harness';
+      headers['x-title'] = process.env['PROTO_OR_TITLE'] ?? 'proto-harness';
     }
     return headers;
   }

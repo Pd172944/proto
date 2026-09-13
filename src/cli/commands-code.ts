@@ -38,6 +38,7 @@ import type { RouteDecision, Tier } from '../router/types.ts';
 import { EpisodeStore } from '../memory/store.ts';
 import type { AgentEvent } from '../agent/loop.ts';
 import { Session, listSessions, loadSession, latestSession, saveSession } from '../agent/session.ts';
+import { productionEdits } from '../agent/edits.ts';
 import { gatherProjectContext } from '../agent/prompt.ts';
 import {
   activityLine,
@@ -582,6 +583,11 @@ export const codeCommand: Command = {
     /* ------------------------------------------------------------ turn */
     const spinner = new Activity();
     let turnIndex = 0;
+    // Set when escalate-on-stuck switched tiers at the end of a turn. The
+    // interactive REPL naturally uses the new tier on the next message; the
+    // one-shot path must explicitly run a continuation turn or the escalation
+    // buys nothing.
+    let escalatedPending = false;
 
     const runTurn = async (input: string): Promise<void> => {
       // Route once per session, on the first message, because that message is a task
@@ -706,6 +712,14 @@ export const codeCommand: Command = {
             chatter(`  ${palette.thinking('↻')} ${palette.dim('reminder injected')}`);
             break;
 
+          case 'compaction':
+            chatter(
+              `  ${palette.thinking('⇣')} ${palette.dim(
+                `compacted context: ${event.elided} output(s) elided, ${event.dropped} message(s) dropped → ~${event.tokens.toLocaleString()} tokens`,
+              )}`,
+            );
+            break;
+
           case 'approval':
             if (event.decision === 'deny') chatter(`    ${palette.error('denied')}`);
             break;
@@ -743,6 +757,9 @@ export const codeCommand: Command = {
           interactive,
           maxSteps: flagNumber(ctx.args, 'max-steps') ?? 40,
           deadlineMs: (flagNumber(ctx.args, 'deadline-min') ?? 10) * 60_000,
+          // Local models have a hard, small context window; compaction in the
+          // loop needs to know it. Cloud models get a generous default.
+          contextTokens: choice.isLocal ? runCfg.local.contextWindow : 200_000,
           temperature: flagNumber(ctx.args, 'temperature') ?? 0.2,
           project,
           index: repoIndex,
@@ -779,7 +796,10 @@ export const codeCommand: Command = {
         // Escalate when the agent burned its whole step budget: being stuck is the one
         // signal from an agent turn that reliably means "this model is not up to it",
         // and it is the session-scale equivalent of the batch path's escalation.
-        if (result.reason === 'max-steps' && flagBool(ctx.args, 'escalate-on-stuck') && tier) {
+        const stuck =
+          result.reason === 'max-steps' ||
+          (productionEdits(result.editedFiles).length === 0 && looksMutating(input) && result.reason === 'complete');
+        if (stuck && flagBool(ctx.args, 'escalate-on-stuck') && tier) {
           const next = nudgeTier(true);
           if (next && next !== tier) {
             try {
@@ -787,8 +807,9 @@ export const codeCommand: Command = {
               tier = next;
               session.model = choice.provider.model;
               session.provider = choice.provider.id;
-              out(palette.warn(`  escalated to ${next} (${choice.label}) after hitting the step budget`));
-              out('');
+              escalatedPending = true;
+              chatter(palette.warn(`  escalated to ${next} (${choice.label}) after hitting the step budget`));
+              chatter('');
             } catch {
               /* keep the current tier if the next one is unavailable */
             }
@@ -968,6 +989,26 @@ export const codeCommand: Command = {
       const prompt = oneShot || 'show me what this harness does';
       if (!print) out(palette.dim(`  › ${prompt}`));
       await runTurn(prompt);
+      // One continuation turn on the stronger tier: the whole point of
+      // escalating is that the stronger model finishes the job, and in
+      // one-shot mode there is no user around to send the next message.
+      if (escalatedPending) {
+        escalatedPending = false;
+        await runTurn(
+          'The previous attempt hit its step budget before finishing. Review the conversation so far, ' +
+            'keep any progress that is correct, and complete the task. Verify before you finish.',
+        );
+      } else if (!readOnly && productionEdits(session.stats.filesEdited).length === 0 && looksMutating(prompt) && exitCode === 0) {
+        // The no-edit guard. A mutating one-shot task that ends with zero
+        // *production* edits is not "done" — writing repro.py used to satisfy
+        // this check and the submitted SWE-bench patch was then empty.
+        chatter(palette.warn('  the task asked for a change but nothing was edited — asking the agent to follow through'));
+        await runTurn(
+          'You finished without editing production source (a repro.py / test file does not count). ' +
+            'Apply the fix with edit_file on an existing library module now, then verify it. ' +
+            'Do not create files at the repository root. Do not stop at analysis.',
+        );
+      }
       if (print) out(result_text_of(session));
       cleanup();
       const saved = flagBool(ctx.args, 'no-save') ? '(not saved: --no-save)' : saveSession(ctx.dataDir, session);
@@ -1112,6 +1153,16 @@ function result_text_of(session: Session): string {
     if (m && m.role === 'assistant' && m.content.trim()) return m.content;
   }
   return '';
+}
+
+/**
+ * Whether a one-shot prompt asks for a change (as opposed to a question or an
+ * explanation). Drives the no-edit guard; a false positive costs one polite
+ * follow-up turn, so this can afford to be broad.
+ */
+function looksMutating(prompt: string): boolean {
+  if (/^(how|why|what|when|where|explain|describe|summar)/i.test(prompt.trim())) return false;
+  return /\b(fix|change|add|remove|implement|update|refactor|rename|make|write|create|patch|resolve|correct|repair|delete|replace)\b/i.test(prompt);
 }
 
 /** A registry with only the read tools, for `--read-only`. */
