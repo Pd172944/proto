@@ -228,8 +228,15 @@ const doctor: Command = {
       );
     }
     if (flagBool(ctx.args, 'probe-cloud')) {
-      if (!keyPresent || !ctx.cfg.cloud.enabled) {
-        human.push(`  probe         skipped (cloud disabled or no key)`);
+      // A keyless endpoint has no key to check, which is not a reason to skip the
+      // only part of doctor that proves the endpoint actually answers. Reachability
+      // is the whole question for a server you host yourself.
+      if (!ctx.cfg.cloud.enabled || (keyRequired && !keyPresent)) {
+        human.push(
+          `  probe         ${style.yellow('skipped')} — ${
+            !ctx.cfg.cloud.enabled ? 'cloud is disabled' : 'no API key, so there is nothing to validate'
+          }`,
+        );
       } else {
         const providers = buildProviders(ctx.cfg, ctx.dataDir);
         const health = providers.cloud ? await providers.cloud.health() : null;
@@ -529,9 +536,15 @@ const run: Command = {
       if (!providers.cloud) {
         throw new Error(`--split needs a cloud tier to plan: ${providers.cloudUnavailable ?? 'unavailable'}`);
       }
-      const localOk = await providers.local.health();
-      if (!localOk.ok) {
-        throw new Error(`--split needs a working local model to execute: ${localOk.detail}`);
+      // Both halves are probed before any work starts. Discovering a dead executor
+      // after a successful planning call wastes the expensive model's time; the
+      // checks are cheap and there are only two of them.
+      const [plannerOk, executorOk] = await Promise.all([providers.cloud.health(), providers.local.health()]);
+      if (!plannerOk.ok) {
+        throw new Error(`--split needs a reachable planner (${providers.cloud.model}): ${plannerOk.detail}`);
+      }
+      if (!executorOk.ok) {
+        throw new Error(`--split needs a working local model to execute: ${executorOk.detail}`);
       }
 
       const features = extractFeatures(taskCtx);

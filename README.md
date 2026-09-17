@@ -326,7 +326,7 @@ src/
   index/          the codebase index: symbols, references, ranked repo map
   util/           logging, argv, text, hashing, atomic fs, process helpers
 test/             383 tests, no network, no hardware required
-docs/             interactive.md · codebase-index.md · routing.md · local-models.md · privacy.md
+docs/             interactive.md · fast-harness.md · codebase-index.md · routing.md · local-models.md · privacy.md
 bench/            the agentic benchmark suite (see bench/README.md)
 scripts/          install.sh · bootstrap-local.sh · humaneval.py
 ```
