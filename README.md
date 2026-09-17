@@ -1,25 +1,90 @@
 # proto-harness
 
-A **coding agent** for your terminal, and the two-regime harness underneath it.
+A **coding agent** for your terminal, built to be the fastest one you can run.
+
+Two models, each doing what it is good at. A strong model **plans**; a fast model
+**executes**; verification decides whether the result is good enough to keep. Point it at
+a model you host yourself and a full agent turn takes about seven seconds.
 
 ```bash
-./scripts/install.sh                 # link `proto` and `proto-code` onto your PATH
-cd ~/my-project && proto-code        # an agent that reads, edits and runs commands
+git clone https://github.com/Pd172944/proto.git && cd proto
+./scripts/install.sh                 # links `proto` and `proto-code` onto your PATH
+
+proto doctor                         # what is installed, what is missing
+proto code                           # interactive agent in the current directory
 ```
 
-Then, if you want the local/cloud economics: easy work goes to a fast model on your
-machine, hard work goes to a cloud model behind your key, and verification decides
-whether the answer was good enough.
+**Zero runtime npm dependencies.** A fresh clone runs `npm test` with no install step.
+Requires Node 22.6+.
 
-Easy coding work — fix an off-by-one, rewrite a loop, rename a symbol, change a
-prompt, add a guard clause, write a docstring — goes to a **very fast local model**
-running on your laptop. Hard work — architecture, migrations, concurrency,
-security, performance — goes to a **cloud model** behind whatever API key you
-already pay for. Every result is **verified locally before you see it**, and failures
-**escalate** automatically.
+## Three ways to run a task
 
-Nothing downloads a model without you asking. There are **zero runtime npm
-dependencies**; it runs on Node 22's built-in tooling.
+| | |
+| --- | --- |
+| `proto code` | interactive agent: reads, edits, runs commands, with an approval gate on every write |
+| `proto run "<task>" --file f.py` | one task, routed to a tier, verified, escalated on failure |
+| `proto run "<task>" --file f.py --split` | **the fast path**: a strong model plans, a fast model writes the edits |
+
+`--split` is what this harness is built around. The planner reads the task and produces
+*intentions*; the executor takes one file and one instruction and produces the concrete
+edit. The executor's prompt is around 400 tokens instead of the 13,000 a full agent turn
+re-sends every step, and the assembled result goes through exactly the same verifier as
+anything else.
+
+```bash
+proto run "fix the off-by-one in paginate()" --file src/page.ts --split
+proto run "..." --file src/page.ts --split --apply     # write it, once verification passes
+```
+
+## Point it at a model you host
+
+This is where the speed comes from. Two levers, in order of size:
+
+**Turn thinking off.** A reasoning model spends most of its tokens on text nobody reads.
+Measured on Qwen3.8-27B, one short answer:
+
+| | total | reasoning tokens |
+| --- | --- | --- |
+| thinking on (its default) | 2.94s | 119 |
+| thinking off | **0.38s** | 0 |
+
+**Put the model near you.** Against the same model on a hosted gateway, a four-step agent
+turn on a two-bug Python fix:
+
+| route | wall clock |
+| --- | --- |
+| hosted gateway (free tier) | 55.8s |
+| self-hosted vLLM, thinking off | **6.9–7.4s** |
+
+```bash
+proto config set cloud.provider  custom
+proto config set cloud.baseUrl   http://your-host:8000/v1
+proto config set cloud.model     Qwen/Qwen3.8-27B
+proto config set cloud.requiresKey false      # a box you own needs no credential
+proto config set cloud.thinking  false        # the single biggest latency lever
+proto doctor --probe-cloud                    # proves it answers, not just that it exists
+```
+
+`requiresKey false` matters: without it the tier is reported unavailable — and worse,
+proto will silently redirect requests to whichever hosted provider happens to have a key
+in `secrets.json`, so your config says one thing and your traffic goes somewhere else.
+
+Full details, including the split's measured behaviour against a genuinely local
+executor, are in **[docs/fast-harness.md](docs/fast-harness.md)**.
+
+## Or run it entirely locally
+
+```bash
+proto setup                          # prints the exact download commands; runs nothing
+proto config set local.model ornith-1.5:9b
+proto code --local
+```
+
+Nothing downloads a model without you asking. A local executor is unmetered, works
+offline, and keeps your code on your machine — at the cost of latency. A 9B on a laptop
+decodes at about 21 tok/s where a hosted model runs an order of magnitude faster.
+
+## How a task is routed
 
 ```
                     ┌─────────────────────────────────────────────┐
@@ -30,8 +95,8 @@ dependencies**; it runs on Node 22's built-in tooling.
               ┌─────────────────────┴─────────────────────┐
               ▼                                           ▼
       ┌───────────────┐                          ┌────────────────┐
-      │  local model  │  fast, free              │  cloud model   │  slow, $$
-      │  (1.5B q4)    │                          │  (your choice) │
+      │  local model  │  fast, free              │  cloud model   │  slower, $$
+      │  (your choice)│                          │  (your choice) │
       └───────┬───────┘                          └────────┬───────┘
               │ candidate                                 │ candidate
               ▼                                           │
@@ -42,6 +107,11 @@ dependencies**; it runs on Node 22's built-in tooling.
       │ patterns,tests│ ──────────────► accept (write only with --apply)
       └───────────────┘
 ```
+
+Routing is a pure function of the task text and your environment — no model is called to
+decide, so a decision costs nothing. Quality floors, hard-locked task classes
+(`security`, `architecture`, `migration`) and cost/latency comparison are in
+**[docs/routing.md](docs/routing.md)**.
 
 ---
 
@@ -273,6 +343,8 @@ your machine.
 | `proto setup [--runtime …] [--download --yes]` | print (or run) local model install instructions |
 | `proto route "<task>" [--file p]… [--explain]` | show the routing decision; no model calls |
 | `proto run "<task>" [--file p]… [--apply] [--tier t] [--mock] [--dry-run]` | full loop: route → attempt → verify → escalate |
+| `proto run "<task>" --split [--split-concurrency n]` | **cloud plans, local executes**; same verifier, different shape |
+| `proto run "<task>" --split --no-repair` | ...and do not let the executor retry after a failed verification |
 | `proto models list \| use <name> \| pull <name> [--yes]` | what the local runtime has, and download commands |
 | `proto config path\|show\|get\|set\|set-key\|providers` | inspect and edit configuration |
 | `proto index [--stats] [--map "focus"] [--symbol N] [--refs N] [--outline p]` | build and inspect the codebase index |
@@ -325,7 +397,7 @@ src/
   harness/        prompt construction and the batch run loop
   index/          the codebase index: symbols, references, ranked repo map
   util/           logging, argv, text, hashing, atomic fs, process helpers
-test/             383 tests, no network, no hardware required
+test/             403 tests, no network or hardware required
 docs/             interactive.md · fast-harness.md · codebase-index.md · routing.md · local-models.md · privacy.md
 bench/            the agentic benchmark suite (see bench/README.md)
 scripts/          install.sh · bootstrap-local.sh · humaneval.py
@@ -395,18 +467,42 @@ Stated plainly, because a research project that hides these is not one:
 ## Development
 
 ```bash
-npm test            # 383 tests, no network or hardware required
-npm run typecheck   # requires typescript installed (devDependency, optional)
-npm run doctor
+npm test            # 403 tests; no network, no GPU, no model required
+npx tsc --noEmit    # after: npm install typescript @types/node
 PROTO_LOG=debug ./bin/proto run "..." --mock
 ```
 
-The test suite covers the components whose silent degradation would be most
-damaging: the router policy (including every veto and hard lock), the verifier, the
-codebase index, the agent loop, session persistence, and the transport layer.
+CI runs both on Node 22 and Node 24, and fails the build if a runtime dependency is
+ever added — the zero-dependency property is a feature, and a fresh clone running
+`npm test` with no install step is the thing it buys.
+
+The suite covers the components whose silent degradation would be most damaging: the
+router policy (every veto and hard lock), the verifier, the codebase index, the agent
+loop, the split pipeline, and the transport layer. See CONTRIBUTING.md for the
+constraints that are not negotiable.
 
 ## Status
 
-Working prototype, actively a research vehicle. Verified on an Apple M5 / 16 GB
-macOS machine with Node 22. No local model is downloaded by this repository, and
-no model was downloaded while building it.
+Working, and honest about what that means.
+
+**Verified:** the fast path end to end — a self-hosted vLLM endpoint, thinking
+disabled, a full agent turn in 6.9–7.4s at $0.00, and the split running with a real
+local 9B executor on a laptop. 403 tests, green on Node 22 and 24.
+
+**Not verified:** any comparison against published SWE-bench or Terminal-Bench numbers.
+The bundled benchmark is ten tasks written by hand, which is enough to tell whether the
+harness works and nowhere near enough to claim a score. `bench/README.md` says why in
+detail, including the confidence intervals on a ten-sample result.
+
+**Untested at scale:** the codebase index has only ever run on repositories of a few
+hundred files. The ranking weights at 50k files are a prediction, and `docs/codebase-index.md`
+labels them as one.
+
+Developed and measured on an Apple M5 / 16 GB macOS machine with Node 22. No model is
+downloaded by this repository, and nothing is downloaded without you asking.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+Built by [Prithvi Dixit](https://github.com/Pd172944).

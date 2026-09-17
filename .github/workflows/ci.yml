@@ -1,0 +1,59 @@
+# The suite is the only thing standing between a change and a silent regression, and
+# until this file existed it only ran when someone remembered. 403 tests that nobody
+# runs are a liability, not a test suite.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.6 is the floor: type stripping is behind a flag there. 24 is where the
+        # flag is no longer needed at all, so both ends of the supported range are
+        # exercised rather than just the version the author happens to run.
+        node: ['22.18', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Test
+        run: npm test
+
+      - name: Typecheck
+        run: |
+          npm install --no-save --no-audit --no-fund typescript @types/node
+          npx tsc --noEmit
+
+  no-runtime-deps:
+    # The zero-dependency property is a feature, not an accident: a fresh clone runs
+    # `npm test` with no install step. This job fails the build if one is ever added.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18'
+      - name: Assert there are no runtime dependencies
+        run: |
+          node -e "
+          const p = require('./package.json');
+          const deps = Object.keys(p.dependencies || {});
+          if (deps.length > 0) {
+            console.error('Runtime dependencies were added: ' + deps.join(', '));
+            console.error('This project runs on Node built-ins alone. See package.json.');
+            process.exit(1);
+          }
+          console.log('No runtime dependencies.');
+          "
+      - name: Test on a clean checkout with no install step
+        run: npm test

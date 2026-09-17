@@ -2,21 +2,56 @@
   "name": "proto-harness",
   "version": "0.1.0",
   "private": true,
-  "type": "module",
-  "description": "Two-regime coding harness: a very fast local model for easy tasks and a cloud model for hard ones, with verification and automatic escalation.",
+  "description": "Two-regime coding harness: routes each task between a fast local model and a cloud model, verifies the result, and escalates when local cannot finish.",
   "license": "MIT",
+  "author": {
+    "name": "Prithvi Dixit",
+    "email": "prithvidixit05@gmail.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Pd172944/proto.git"
+  },
+  "homepage": "https://github.com/Pd172944/proto#readme",
+  "bugs": {
+    "url": "https://github.com/Pd172944/proto/issues"
+  },
+  "keywords": [
+    "coding-agent",
+    "llm",
+    "local-first",
+    "vllm",
+    "ollama",
+    "router",
+    "code-index",
+    "cli",
+    "zero-dependencies"
+  ],
+  "type": "module",
   "engines": {
     "node": ">=22.6.0"
   },
   "bin": {
-    "proto": "./bin/proto"
+    "proto": "./bin/proto",
+    "proto-code": "./bin/proto-code"
   },
+  "files": [
+    "bin/",
+    "src/",
+    "scripts/",
+    "docs/",
+    "bench/",
+    "README.md",
+    "ARCHITECTURE.md",
+    "LICENSE"
+  ],
   "scripts": {
     "proto": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/cli.ts",
     "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test test/*.test.ts",
     "test:watch": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test --watch test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "doctor": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/cli.ts doctor"
+    "doctor": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/cli.ts doctor",
+    "ci": "npm test"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
