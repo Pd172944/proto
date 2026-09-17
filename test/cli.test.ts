@@ -145,7 +145,7 @@ describe('cli: basics', () => {
     const res = await cli(['help']);
     assert.equal(res.code, 0);
     assert.match(res.stdout, /two-regime coding harness/);
-    for (const cmd of ['doctor', 'setup', 'route', 'run', 'episodes', 'train', 'eval', 'replay', 'contrib']) {
+    for (const cmd of ['doctor', 'setup', 'route', 'run', 'index', 'models', 'config', 'code']) {
       assert.ok(res.stdout.includes(cmd), `help must list "${cmd}"`);
     }
   });
@@ -203,50 +203,18 @@ describe('cli: routing and evaluation', () => {
     assert.ok(parsed.decision.vetoes.some((v) => v.includes('cloud tier unavailable')));
   });
 
-  it('scores the eval corpus above the regression floor', async () => {
-    const res = await cli(['eval', 'run', '--json']);
-    assert.equal(res.code, 0);
-    const parsed = JSON.parse(res.stdout) as { report: { metrics: { accuracy: number; confusion: { cloud: { local: number } } } } };
-    assert.ok(parsed.report.metrics.accuracy >= 0.9, `accuracy regressed to ${parsed.report.metrics.accuracy}`);
-    assert.equal(parsed.report.metrics.confusion.cloud.local, 0, 'no cloud task may be routed local');
-  });
-
   it('runs a dry run that writes nothing and reports the decision', async () => {
     const res = await cli(['run', 'Rename the variable a to count', '--dry-run', '--json']);
     assert.equal(res.code, 0);
-    const parsed = JSON.parse(res.stdout) as { result: { status: string; episode: unknown; writtenFiles: string[] } };
+    const parsed = JSON.parse(res.stdout) as { result: { status: string; attempts: unknown[]; writtenFiles: string[] } };
     assert.equal(parsed.result.status, 'dry-run');
-    assert.equal(parsed.result.episode, null);
+    assert.deepEqual(parsed.result.attempts, []);
     assert.deepEqual(parsed.result.writtenFiles, []);
   });
 
-  it('replays an empty log without failing', async () => {
-    const res = await cli(['replay', '--json']);
-    assert.equal(res.code, 0);
-    const parsed = JSON.parse(res.stdout) as { report: { episodes: number; notes: string[] } };
-    assert.equal(parsed.report.episodes, 0);
-    assert.ok(parsed.report.notes.some((n) => /no model calls/.test(n)));
-  });
 });
 
 describe('cli: exit-code contract', () => {
-  it('exits 0 when a tick correctly declines to train', async () => {
-    // This is the normal outcome: the gates are doing their job. A cron agent
-    // must not read it as a failure.
-    const res = await cli(['train', 'tick']);
-    assert.equal(res.code, 0, res.stderr);
-  });
-
-  it('exits 0 for a dry-run plan', async () => {
-    const res = await cli(['train', 'plan']);
-    assert.equal(res.code, 0, res.stderr);
-  });
-
-  it('exits non-zero when a forced session cannot start', async () => {
-    const res = await cli(['train', 'now']);
-    assert.equal(res.code, 1, `expected 1, got ${res.code}`);
-  });
-
   it('exits non-zero when a task cannot be completed', async () => {
     // No local runtime and no cloud key in a fresh PROTO_HOME, so the run cannot
     // produce a verified answer; the CLI must say so in its exit code.
@@ -281,37 +249,6 @@ describe('cli: introspection commands', () => {
     assert.match(res.stdout, /refusing to download/);
   });
 
-  it('explains the training gates truthfully', async () => {
-    const res = await cli(['train', 'status', '--json']);
-    assert.equal(res.code, 0);
-    const parsed = JSON.parse(res.stdout) as { status: { gates: { allowed: boolean; checks: Array<{ ok: boolean; detail: string }> } } };
-    assert.equal(parsed.status.gates.allowed, false);
-    assert.ok(parsed.status.gates.checks.length >= 8, 'every gate must be reported');
-    assert.ok(parsed.status.gates.checks.every((c) => c.detail.length > 0), 'every gate must explain itself');
-  });
-
-  it('previews a contribution and refuses to upload it', async () => {
-    const res = await cli(['contrib', 'preview', '--json']);
-    assert.equal(res.code, 0);
-    const parsed = JSON.parse(res.stdout) as { preview: { wouldUpload: boolean; uploadBlockers: string[] } };
-    assert.equal(parsed.preview.wouldUpload, false);
-    assert.ok(parsed.preview.uploadBlockers.length > 0);
-  });
-
-  it('shows the redactor working, with counts', async () => {
-    const res = await cli([
-      'episodes',
-      'redact-check',
-      '--text',
-      'API_KEY=sk-proj-abcdefghijklmnop1234 mail me at dev@example.com',
-      '--json',
-    ]);
-    assert.equal(res.code, 0);
-    const parsed = JSON.parse(res.stdout) as { text: string; counts: Record<string, number> };
-    assert.ok(!parsed.text.includes('sk-proj-abcdefghijklmnop1234'));
-    assert.ok(!parsed.text.includes('dev@example.com'));
-    assert.ok(Object.keys(parsed.counts).length > 0);
-  });
 });
 
 /**

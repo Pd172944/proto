@@ -117,34 +117,10 @@ export function applyEnvOverrides(cfg: ProtoConfig): ProtoConfig {
     out.cloud.enabled = true;
   }
 
-  const routingMode = envStr('PROTO_ROUTING_MODE');
-  if (routingMode && ['heuristic', 'learned', 'hybrid'].includes(routingMode)) {
-    out.routing.mode = routingMode as ProtoConfig['routing']['mode'];
-  }
   const floor = envNum('PROTO_QUALITY_FLOOR');
   if (floor !== undefined) out.routing.qualityFloor = clamp01(floor);
   const budget = envNum('PROTO_CLOUD_BUDGET_USD');
   if (budget !== undefined) out.routing.cloudBudgetUsdPerDay = budget;
-
-  if (envBool('PROTO_DISABLE_MEMORY') !== undefined) out.memory.enabled = !envBool('PROTO_DISABLE_MEMORY');
-  if (envBool('PROTO_DISABLE_REDACTION') !== undefined) out.memory.redact = !envBool('PROTO_DISABLE_REDACTION');
-  const storeText = envBool('PROTO_STORE_TASK_TEXT');
-  if (storeText !== undefined) out.memory.storeTaskText = storeText;
-
-  const trainEnabled = envBool('PROTO_TRAIN_ENABLED');
-  if (trainEnabled !== undefined) out.train.enabled = trainEnabled;
-  const trainMode = envStr('PROTO_TRAIN_MODE');
-  if (trainMode === 'sft' || trainMode === 'dpo') out.train.lora.mode = trainMode;
-
-  const contribEnabled = envBool('PROTO_CONTRIB_ENABLED');
-  if (contribEnabled !== undefined) out.contrib.enabled = contribEnabled;
-  const shareCode = envBool('PROTO_CONTRIB_SHARE_CODE');
-  if (shareCode !== undefined) out.contrib.shareCode = shareCode;
-  const endpoint = envStr('PROTO_CONTRIB_ENDPOINT');
-  if (endpoint) out.contrib.endpoint = endpoint;
-
-  const evalMode = envStr('PROTO_EVAL_MODE');
-  if (evalMode === 'route' || evalMode === 'live') out.eval.mode = evalMode;
 
   return out;
 }
@@ -270,9 +246,6 @@ function validate(cfg: ProtoConfig, warnings: string[]): void {
   if (cfg.routing.qualityFloor < 0 || cfg.routing.qualityFloor > 1) {
     warnings.push(`routing.qualityFloor must be in [0,1]; clamping`);
     cfg.routing.qualityFloor = clamp01(cfg.routing.qualityFloor);
-  }
-  if (cfg.train.windowStartHour === cfg.train.windowEndHour) {
-    warnings.push('train.windowStartHour equals windowEndHour: the window is empty, no training will run');
   }
   if (cfg.local.contextWindow > 32768) {
     warnings.push(

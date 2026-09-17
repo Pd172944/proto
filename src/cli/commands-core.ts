@@ -13,10 +13,6 @@ import { routeTask } from '../router/index.ts';
 import { heuristicScore } from '../router/heuristic.ts';
 import type { TaskContext, Tier } from '../router/types.ts';
 import { runTask } from '../harness/loop.ts';
-import { EpisodeStore } from '../memory/store.ts';
-import { buildDatasets } from '../memory/datasets.ts';
-import { preflight } from '../train/mlx.ts';
-import { listAdapters, getActiveAdapter } from '../train/adapter.ts';
 import { PROVIDER_PROFILES, providerProfile } from '../config/schema.ts';
 import { cloudBaseUrl, priceFor, resolveApiKeyFor, saveConfig, writeSecret } from '../config/load.ts';
 import { formatBytes, formatDuration, readTextOrNull, resolvePath, fileExists } from '../util/fsx.ts';
@@ -163,8 +159,6 @@ const doctor: Command = {
       human.push(`  ${style.yellow('hint')}          ${localHealth.hint}`);
       nextSteps.push(localHealth.hint);
     }
-    const active = getActiveAdapter(ctx.dataDir);
-    human.push(`  adapter       ${active ? `${active.name} (active since ${active.promotedAt})` : 'none trained yet'}`);
     human.push('');
 
     // ---- cloud tier ----
@@ -252,31 +246,6 @@ const doctor: Command = {
       );
     }
     human.push('');
-
-    // ---- trainer ----
-    human.push(style.bold('local training (opt-in)'));
-    const pf = await preflight(ctx.dataDir);
-    human.push(`  enabled       ${ctx.cfg.train.enabled ? style.green('yes') : 'no (opt-in: `proto train enable`)'}`);
-    human.push(`  base model    ${ctx.cfg.train.baseModel}`);
-    human.push(`  trainer       ${pf.ok ? style.green(pf.detail) : style.yellow(pf.detail)}`);
-    report['trainer'] = { enabled: ctx.cfg.train.enabled, baseModel: ctx.cfg.train.baseModel, preflight: pf };
-    if (!pf.ok) {
-      nextSteps.push(`to enable local fine-tuning later, run: ${pf.installInstructions[0]} && ${pf.installInstructions[2]}`);
-    }
-    human.push('');
-
-    // ---- data ----
-    const store = new EpisodeStore(ctx.dataDir);
-    const stats = store.stats();
-    const datasets = buildDatasets(store, ctx.cfg, { write: false });
-    human.push(style.bold('data'));
-    human.push(`  episodes      ${stats.episodes} across ${stats.shardCount} shard(s), ${formatBytes(stats.totalBytes)}`);
-    human.push(`  local success ${stats.localSuccessRate === null ? 'n/a' : `${(stats.localSuccessRate * 100).toFixed(1)}% over ${stats.localAttempts} verified attempt(s)`}`);
-    human.push(`  escalations   ${stats.escalations}`);
-    human.push(`  cloud spend   $${stats.cloudSpendUsd.toFixed(4)} total, $${stats.spendTodayUsd.toFixed(4)} today (budget $${ctx.cfg.routing.cloudBudgetUsdPerDay.toFixed(2)}/day)`);
-    human.push(`  datasets      SFT ${datasets.sft.samples.length}, DPO ${datasets.dpo.samples.length}, router ${datasets.router.samples.length}`);
-    human.push(`  adapters      ${listAdapters(ctx.dataDir).length}`);
-    report['data'] = { stats, datasets: datasets.stats };
 
     human.push('');
     human.push(style.bold('next steps'));
@@ -450,23 +419,18 @@ const route: Command = {
       ...(flagBool(ctx.args, 'offline') ? { offline: true } : {}),
     });
 
-    const store = new EpisodeStore(ctx.dataDir);
-    const spendToday = store.stats().spendTodayUsd;
 
     const human: string[] = [];
     human.push(style.bold('routing decision'));
     human.push(`  tier          ${style.cyan(decision.tier)}`);
     human.push(`  reason        ${decision.reason}`);
     human.push(`  p(local ok)   ${decision.pLocalSuccess.toFixed(3)}   difficulty ${decision.difficulty.toFixed(3)}   class ${decision.taskClass}`);
-    human.push(`  scorer        ${decision.scorer}`);
     human.push(
-      `  est. cost     local $${decision.expected.localCostUsd.toFixed(4)} vs cloud $${decision.expected.cloudCostUsd.toFixed(4)}   ` +
-        `(cloud spend today $${spendToday.toFixed(4)} / $${ctx.cfg.routing.cloudBudgetUsdPerDay.toFixed(2)})`,
+      `  est. cost     local $${decision.expected.localCostUsd.toFixed(4)} vs cloud $${decision.expected.cloudCostUsd.toFixed(4)}`,
     );
     human.push(
       `  est. latency  local ${formatDuration(decision.expected.localLatencyMs)} vs cloud ${formatDuration(decision.expected.cloudLatencyMs)}`,
     );
-    if (decision.exploration) human.push(`  ${style.yellow('exploration')}   this decision is exploratory, not utility-driven`);
     if (decision.forced) human.push(`  ${style.yellow('forced')}        the preferred tier was unavailable`);
     human.push('');
     human.push(style.bold('why'));
@@ -490,7 +454,7 @@ const route: Command = {
       }
     }
 
-    return { human, json: { ok: true, decision, spendTodayUsd: spendToday } };
+    return { human, json: { ok: true, decision } };
   },
 };
 
@@ -530,7 +494,6 @@ const run: Command = {
     }
 
     const useMock = flagBool(ctx.args, 'mock');
-    const store = new EpisodeStore(ctx.dataDir);
 
     const result = await runTask({
       cfg: ctx.cfg,
@@ -543,23 +506,19 @@ const run: Command = {
       ...(useMock ? { localProvider: new MockProvider({ id: 'mock-local', kind: 'local' }) } : {}),
       ...(flagBool(ctx.args, 'mock') ? { cloudProvider: new MockProvider({ id: 'mock-cloud', kind: 'cloud', model: 'mock-strong' }) } : {}),
       ...(flagBool(ctx.args, 'unload') ? { unloadLocalAfter: true } : {}),
-      store,
-      persist: ctx.cfg.memory.enabled,
     });
 
     const human: string[] = [];
     human.push(style.bold('run'));
     human.push(`  tier          ${style.cyan(result.decision.tier)} — ${result.decision.reason}`);
     human.push(`  status        ${renderStatus(result.status)}`);
-    if (result.episode) {
-      human.push(`  episode       ${result.episode.id}`);
+    if (result.attempts.length > 0) {
       human.push(
-        `  attempts      ${result.episode.attempts.length} ` +
-          `(${result.episode.attempts.map((a) => `${a.tier}/${a.source}${a.error ? ' ERR' : ''}`).join(', ')})`,
+        `  attempts      ${result.attempts.length} ` +
+          `(${result.attempts.map((a) => `${a.tier}/${a.source}${a.error ? ' ERR' : ''}`).join(', ')})`,
       );
-      human.push(`  cost          $${result.episode.outcome.totalCostUsd.toFixed(4)}   latency ${formatDuration(result.episode.outcome.totalLatencyMs)}`);
-      human.push(`  reward        ${result.episode.outcome.reward.toFixed(3)} (v${result.episode.outcome.rewardVersion})`);
-      human.push(`  label         localSucceeded=${result.episode.outcome.localSucceeded === null ? 'n/a' : String(result.episode.outcome.localSucceeded)}`);
+      const latency = result.attempts.reduce((a, x) => a + x.latencyMs, 0);
+      human.push(`  cost          $${result.totalCostUsd.toFixed(4)}   latency ${formatDuration(latency)}`);
     }
 
     if (result.report) {
@@ -641,9 +600,6 @@ const models: Command = {
     if (sub === 'list') {
       const local = buildLocalProvider(ctx.cfg);
       const health = await local.health();
-      const adapters = listAdapters(ctx.dataDir);
-      const active = getActiveAdapter(ctx.dataDir);
-
       human.push(style.bold(`local models (${ctx.cfg.local.runtime} @ ${ctx.cfg.local.baseUrl})`));
       if (!health.ok && !health.models?.length) {
         human.push(`  ${style.yellow('runtime not reachable')} — ${health.detail}`);
@@ -655,19 +611,9 @@ const models: Command = {
         }
       }
       human.push('');
-      human.push(style.bold('training'));
-      human.push(`  base model    ${ctx.cfg.train.baseModel}`);
-      human.push(`  adapters      ${adapters.length}`);
-      for (const a of adapters) {
-        const isActive = active?.name === a.name;
-        human.push(
-          `  - ${a.name}${isActive ? style.green(' (active)') : ''} mode=${a.mode} ${a.complete ? '' : style.yellow('(incomplete)')} ` +
-            `${formatBytes(a.sizeBytes)}${a.trainLoss !== null ? ` loss=${a.trainLoss}` : ''}`,
-        );
-      }
       return {
         human,
-        json: { ok: true, runtime: ctx.cfg.local.runtime, baseUrl: ctx.cfg.local.baseUrl, health, adapters, activeAdapter: active },
+        json: { ok: true, runtime: ctx.cfg.local.runtime, baseUrl: ctx.cfg.local.baseUrl, health },
       };
     }
 

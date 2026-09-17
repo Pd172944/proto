@@ -196,13 +196,3 @@ export function heuristicScore(f: TaskFeatures): HeuristicScore {
   return { pLocalSuccess, difficulty, contributions };
 }
 
-/** Blend a learned probability with the heuristic prior, weighted by sample size. */
-export function blendWithPrior(learned: number, prior: number, sampleCount: number): {
-  p: number;
-  learnedWeight: number;
-} {
-  // Shrinkage: with few observations, trust the heuristic. Caps at 0.85 so the
-  // heuristic never fully disappears (it is the safety net described above).
-  const w = Math.min(0.85, sampleCount / (sampleCount + 60));
-  return { p: clamp01(w * learned + (1 - w) * prior), learnedWeight: w };
-}

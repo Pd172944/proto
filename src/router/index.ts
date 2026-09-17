@@ -11,7 +11,6 @@
 import { join } from 'node:path';
 
 import { extractFeatures } from './features.ts';
-import { LogisticScorer } from './learned.ts';
 import { decideRoute, estimateLocalTokensPerSec } from './policy.ts';
 import type { RouterEnvironment } from './policy.ts';
 import type { RouteDecision, TaskContext } from './types.ts';
@@ -19,27 +18,6 @@ import type { ProtoConfig } from '../config/schema.ts';
 import { priceFor, resolveApiKeyFor } from '../config/load.ts';
 import { cloudTierModel } from '../providers/index.ts';
 import { readJsonOrNull, writeJsonAtomic } from '../util/fsx.ts';
-
-export function routerWeightsPath(dataDir: string): string {
-  return join(dataDir, 'router', 'weights.json');
-}
-
-/** Load trained weights, tolerating absence and version drift. */
-export function loadScorer(dataDir: string): { scorer: LogisticScorer | null; error?: string } {
-  const file = readJsonOrNull<Parameters<typeof LogisticScorer.fromFile>[0]>(routerWeightsPath(dataDir));
-  if (!file) return { scorer: null };
-  try {
-    return { scorer: LogisticScorer.fromFile(file) };
-  } catch (err) {
-    return { scorer: null, error: err instanceof Error ? err.message : String(err) };
-  }
-}
-
-export function saveScorer(dataDir: string, scorer: LogisticScorer, notes: string[] = []): string {
-  const path = routerWeightsPath(dataDir);
-  writeJsonAtomic(path, scorer.toFile(notes));
-  return path;
-}
 
 export interface RouteOptions {
   cfg: ProtoConfig;
@@ -56,7 +34,6 @@ export interface RouteOptions {
   cloudSpendTodayUsd?: number;
   /** Whether verification will run on the candidate. */
   verifierAvailable?: boolean;
-  random?: () => number;
   /** Override the local decode-speed estimate (e.g. measured from episodes). */
   localTokensPerSec?: number;
 }
@@ -125,37 +102,23 @@ export async function routeTask(opts: RouteOptions): Promise<RouteDecision> {
     verifierAvailable: opts.verifierAvailable ?? cfg.verify.enabled,
     cloudBudgetRemainingUsd: Math.max(0, budget - spent),
     price,
-    ...(opts.random ? { random: opts.random } : {}),
   };
 
-  const { scorer, error: scorerError } = loadScorer(dataDir);
 
   const decision = decideRoute({
     ctx,
     features,
     cfg,
     env,
-    scorer,
   });
 
-  if (scorerError) {
-    return {
-      ...decision,
-      scorerError,
-      reasons: [
-        `trained router weights were ignored: ${scorerError}`,
-        ...decision.reasons,
-      ],
-    };
-  }
   return decision;
 }
 
 export * from './types.ts';
-export { extractFeatures, classifyTask, analyzeCode, toVector } from './features.ts';
-export { FEATURE_NAMES, FEATURE_VECTOR_VERSION, TIERS, tierRank, isLocalTier } from './types.ts';
+export { extractFeatures, classifyTask, analyzeCode } from './features.ts';
+export { TIERS, tierRank, isLocalTier } from './types.ts';
 export { heuristicScore, sigmoid } from './heuristic.ts';
-export { LogisticScorer, trainLogistic, evaluate, featureImportance, MIN_TRAINING_SAMPLES } from './learned.ts';
 export {
   decideRoute,
   decisionUtility,

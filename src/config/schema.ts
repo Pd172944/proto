@@ -313,117 +313,8 @@ export interface VerifyConfig {
   rejectNewTodos: boolean;
 }
 
-export interface MemoryConfig {
-  enabled: boolean;
-  /** Run the redactor before persisting. Turning this off is a supported but discouraged choice. */
-  redact: boolean;
-  retentionDays: number;
-  /** Rotate to a new shard file above this size. */
-  maxShardBytes: number;
-  /** Cap on stored characters per candidate output. */
-  maxOutputChars: number;
-  /** Also store the raw task text. Off = only features + hashes are kept. */
-  storeTaskText: boolean;
-  /**
-   * Store the exact prompt sent to the model. Required to build SFT/DPO
-   * datasets later (a prompt cannot be faithfully reconstructed once the files
-   * it described have changed), but it is also the most sensitive field, so it
-   * is capped and always redacted.
-   */
-  storePrompts: boolean;
-  maxPromptChars: number;
-}
 
-export interface TrainConfig {
-  /** Master switch. Default false: we never touch the user's CPU uninvited. */
-  enabled: boolean;
-  /** Which trainer to drive. Only MLX LoRA is wired up today. */
-  backend: 'mlx-lora';
-  /**
-   * The Hugging Face repo (or local path) that LoRA is applied to.
-   *
-   * This is deliberately separate from `local.model`: the inference model is
-   * usually an Ollama tag (`qwen2.5-coder:1.5b-instruct`) while training needs a
-   * Hugging Face repo that MLX can load. Conflating the two produces a confusing
-   * failure where training "cannot find" a model that inference uses fine.
-   */
-  baseModel: string;
-  /** Minimum number of new, rewarded episodes before a job is worth queueing. */
-  minNewEpisodes: number;
-  /** Allowed wall-clock window, local time, 24h. e.g. 1 -> 6 means 01:00-06:00. */
-  windowStartHour: number;
-  windowEndHour: number;
-  /** Only train while on wall power. */
-  requireAC: boolean;
-  /** Skip when the machine is thermally throttled. */
-  respectThermalState: boolean;
-  /** Skip when 1-minute load average exceeds this. */
-  maxLoadAverage: number;
-  /** Skip when battery is below this and on battery (informational). */
-  minBatteryPct: number;
-  /** Hard cap on a single tuning session. */
-  maxRuntimeMin: number;
-  /** Daily compute budget across all sessions. */
-  dailyBudgetMin: number;
-  /** LoRA hyperparameters (deliberately tiny: this is meant to be nearly free). */
-  lora: {
-    layers: number;
-    rank: number;
-    scale: number;
-    dropout: number;
-    learningRate: number;
-    batchSize: number;
-    /**
-     * Target number of passes over the training set.
-     *
-     * This replaces the old fixed `iters` knob. A step count is meaningless
-     * without knowing how much data exists: 60 iterations at batch size 1 shows
-     * the model 60 examples, which on a 400-row dataset is 15% of a single epoch
-     * and cannot teach anything. What actually matters is how many times the model
-     * sees the data, so that is what is configured.
-     */
-    epochs: number;
-    /** Hard ceiling on optimisation steps, whatever the epoch target implies. */
-    maxIters: number;
-    maxSeqLen: number;
-    /** Which training mode to use for the selected dataset. */
-    mode: 'sft' | 'dpo';
-  };
-  /**
-   * Cap on training rows per run.
-   *
-   * Deliberately separate from the `datasets build` caps: those exist so a human
-   * can inspect a bounded sample, whereas these decide how much of your history
-   * actually reaches the model. Discarding rows buys nothing.
-   */
-  maxSftSamples: number;
-  maxDpoSamples: number;
-  /**
-   * Fallback seconds per optimisation step, used to size a session against the
-   * time budget before any history exists. Once jobs have run, the scheduler
-   * measures the real rate from their recorded duration and ignores this.
-   */
-  secondsPerStep: number;
-  /** Keep at most this many adapters on disk. */
-  keepAdapters: number;
-  /** Auto-promote a freshly trained adapter to the serving runtime. */
-  autoPromote: boolean;
-}
 
-export interface ContribConfig {
-  /** Sharing anything is opt-in and off by default. */
-  enabled: boolean;
-  /** Share raw task/output text. Off means only features, hashes and preference labels. */
-  shareCode: boolean;
-  /** Upload endpoint. Empty = stage locally in the outbox and never send. */
-  endpoint: string;
-  /** Cap on bytes staged per day. */
-  maxBytesPerDay: number;
-  /** Rotate the device pseudonym salt every N days (forward privacy). */
-  saltRotateDays: number;
-  /** Require an explicit `--yes` on every upload even when enabled. */
-  requireConfirmation: boolean;
-}
 
 export interface ProtoConfig {
   version: 1;
@@ -433,18 +324,7 @@ export interface ProtoConfig {
   cloud: CloudConfig;
   routing: RoutingConfig;
   verify: VerifyConfig;
-  memory: MemoryConfig;
-  train: TrainConfig;
-  contrib: ContribConfig;
   pricing: Record<string, Price>;
-  /** Extra regexes (as strings) for the redactor. */
-  redactionPatterns: string[];
-  /** Model used by the eval harness for the "expected tier" baseline. */
-  eval: {
-    /** `route` = offline routing metrics only; `live` also calls models. */
-    mode: 'route' | 'live';
-    liveSampleSize: number;
-  };
 }
 
 export const DEFAULT_CONFIG: ProtoConfig = {
@@ -500,63 +380,7 @@ export const DEFAULT_CONFIG: ProtoConfig = {
     forbiddenPatterns: [],
     rejectNewTodos: true,
   },
-  memory: {
-    enabled: true,
-    redact: true,
-    retentionDays: 90,
-    maxShardBytes: 8 * 1024 * 1024,
-    maxOutputChars: 8000,
-    storeTaskText: true,
-    storePrompts: true,
-    maxPromptChars: 12000,
-  },
-  train: {
-    enabled: false,
-    backend: 'mlx-lora',
-    baseModel: 'mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit',
-    minNewEpisodes: 25,
-    windowStartHour: 1,
-    windowEndHour: 6,
-    requireAC: true,
-    respectThermalState: true,
-    maxLoadAverage: 4,
-    minBatteryPct: 20,
-    maxRuntimeMin: 20,
-    dailyBudgetMin: 60,
-    lora: {
-      layers: 8,
-      rank: 8,
-      scale: 16,
-      dropout: 0.05,
-      learningRate: 1e-5,
-      // Batch 4 rather than 1: a single-example gradient is mostly noise, so the
-      // step budget is better spent on fewer, better-conditioned updates.
-      batchSize: 4,
-      epochs: 3,
-      maxIters: 2000,
-      maxSeqLen: 1024,
-      mode: 'sft',
-    },
-    maxSftSamples: 2000,
-    maxDpoSamples: 1000,
-    secondsPerStep: 1.5,
-    keepAdapters: 3,
-    autoPromote: false,
-  },
-  contrib: {
-    enabled: false,
-    shareCode: false,
-    endpoint: '',
-    maxBytesPerDay: 5 * 1024 * 1024,
-    saltRotateDays: 7,
-    requireConfirmation: true,
-  },
   pricing: DEFAULT_PRICING,
-  redactionPatterns: [],
-  eval: {
-    mode: 'route',
-    liveSampleSize: 10,
-  },
 };
 
 /** Tier names, kept here so config and router agree on the vocabulary. */

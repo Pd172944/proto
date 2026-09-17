@@ -17,8 +17,6 @@
  */
 
 import {
-  FEATURE_NAMES,
-  FEATURE_VECTOR_VERSION,
 } from './types.ts';
 import type { TaskClass, TaskContext, TaskFeatures } from './types.ts';
 import { countMatches, estimateTokens } from '../util/text.ts';
@@ -628,68 +626,3 @@ function detectFencedLanguages(text: string): string[] {
 /* Vectorization                                                       */
 /* ------------------------------------------------------------------ */
 
-/**
- * Map features onto the fixed numeric vector consumed by the learned scorer.
- * Counts are log1p-scaled so that a 10k-line file does not dominate a 10-line one.
- */
-export function toVector(f: TaskFeatures): number[] {
-  const log1p = (n: number): number => Math.log1p(Math.max(0, n));
-  const cls = f.taskClass;
-  return [
-    1, // bias
-    log1p(f.estInputTokens) / 10,
-    log1p(f.estOutputTokens) / 8,
-    log1p(f.fileCount),
-    log1p(f.changedLines) / 5,
-    log1p(f.loopCount),
-    log1p(f.funcCount),
-    log1p(f.maxNesting) / 2,
-    log1p(f.branchCount) / 3,
-    f.hasAsync ? 1 : 0,
-    f.hasConcurrency ? 1 : 0,
-    f.hasTypes ? 1 : 0,
-    f.hasErrorHandling ? 1 : 0,
-    f.hasTestsInScope ? 1 : 0,
-    f.hasStackTrace ? 1 : 0,
-    f.hasReproSteps ? 1 : 0,
-    f.hasExplicitAcceptanceCriteria ? 1 : 0,
-    f.hasExternalApiMention ? 1 : 0,
-    f.hasPerfLanguage ? 1 : 0,
-    f.hasSecurityLanguage ? 1 : 0,
-    f.hasMigrationLanguage ? 1 : 0,
-    f.isQuestion ? 1 : 0,
-    f.isExplainOnly ? 1 : 0,
-    log1p(f.constraintCount),
-    f.ambiguity,
-    f.locality,
-    f.mentionsSpecificSymbol ? 1 : 0,
-    f.classDifficulty,
-    cls === 'local-edit' ? 1 : 0,
-    cls === 'bugfix-local' ? 1 : 0,
-    cls === 'add-validation' ? 1 : 0,
-    cls === 'rename' || cls === 'format' || cls === 'prompt-edit' ? 1 : 0,
-    cls === 'write-tests' ? 1 : 0,
-    cls === 'docs' || cls === 'explain' ? 1 : 0,
-    cls === 'refactor-multi' ? 1 : 0,
-    cls === 'feature-new' ? 1 : 0,
-    cls === 'perf' ? 1 : 0,
-    cls === 'debug-unknown' ? 1 : 0,
-    cls === 'concurrency' ? 1 : 0,
-    cls === 'security' ? 1 : 0,
-    cls === 'migration' ? 1 : 0,
-    cls === 'architecture' ? 1 : 0,
-    cls === 'algorithm' ? 1 : 0,
-  ];
-}
-
-/** Guard against silent feature/vector drift. */
-export function assertVectorShape(v: number[]): void {
-  if (v.length !== FEATURE_NAMES.length) {
-    throw new Error(
-      `feature vector length ${v.length} does not match FEATURE_NAMES (${FEATURE_NAMES.length}); ` +
-        `bump FEATURE_VECTOR_VERSION and retrain`,
-    );
-  }
-}
-
-export { FEATURE_VECTOR_VERSION };

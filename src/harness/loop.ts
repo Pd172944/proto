@@ -1,55 +1,40 @@
 /**
- * The agent loop.
+ * The batch task loop: route a task, attempt it, verify it, escalate if needed.
  *
- * One task in, one episode out. The shape is:
+ * One task in, one verified result out. The shape is:
  *
- *     route -> (local attempt -> verify -> repair) -> escalate -> verify -> record
+ *     route -> (local attempt -> verify -> repair) -> escalate -> verify
  *
- * Five things about this loop are deliberate and worth stating, because they
- * are where a naive implementation would quietly go wrong:
+ * Four things about this loop are deliberate and worth stating, because they are
+ * where a naive implementation would quietly go wrong:
  *
- *  1. **Verification, not vibes, decides success.** An attempt "succeeded" iff
- *     the verifier passed it. This is what makes `localSucceeded` a usable RL
- *     label and what makes escalation trustworthy.
+ *  1. **Verification, not vibes, decides success.** An attempt "succeeded" iff the
+ *     verifier passed it. This is what makes escalation trustworthy: we never
+ *     escalate because a model *sounded* unsure, only because a check failed.
  *
- *  2. **Escalation is bounded.** `maxCloudAttempts` caps worst-case spend, and
- *     the cloud budget is checked before every cloud call. A routing bug can
- *     cost the user a few cents, not a surprise bill.
+ *  2. **Escalation is bounded.** `maxCloudAttempts` caps worst-case spend. A
+ *     routing bug can cost the user a few cents, not a surprise bill.
  *
  *  3. **Nothing is written to the workspace unless asked.** `apply` is off by
  *     default. The verifier works on an in-memory copy of the files.
  *
- *  4. **Failures still produce training data.** A local failure followed by a
- *     cloud success is the single most valuable record in the system (it is a
- *     verified preference pair). The loop records it even when the user's task
- *     ultimately fails, and records it *before* any early return.
- *
- *  5. **Provider transport errors are not model failures.** If the local server
- *     is down we record `error` on the attempt and escalate, rather than
- *     scoring the local model as wrong. Conflating the two poisons the router's
- *     training data with "the model is bad" labels for an unrelated outage.
+ *  4. **Provider transport errors are not model failures.** If the local server is
+ *     down we record the error on the attempt and escalate, rather than scoring the
+ *     local model as wrong — conflating the two would make the router's own
+ *     statistics lie about why a task failed.
  */
 
 import { buildCloudProvider, buildLocalProvider, cloudTierModel } from '../providers/index.ts';
 import type { ChatResponse, Message, Provider } from '../providers/types.ts';
 import { ProviderError } from '../providers/types.ts';
-import { priceFor, resolveApiKeyFor } from '../config/load.ts';
+import { resolveApiKeyFor } from '../config/load.ts';
 import type { ProtoConfig } from '../config/schema.ts';
 import { routeTask } from '../router/index.ts';
 import type { RouteDecision, TaskContext, Tier } from '../router/types.ts';
-import { FEATURE_VECTOR_VERSION } from '../router/types.ts';
 import { verifyCandidate } from '../verify/index.ts';
 import type { VerificationReport } from '../verify/types.ts';
-import { EpisodeStore } from '../memory/store.ts';
-import { behaviorPropensity, computeReward } from '../memory/reward.ts';
-import type { AttemptRecord, AttemptSource, Episode, RedactionReport } from '../memory/types.ts';
-import { EPISODE_SCHEMA_VERSION, decisionFromRoute } from '../memory/types.ts';
-import { redact } from '../memory/redact.ts';
-import { buildMessages, buildRepairPrompt, buildUserPrompt, repairSystemPrompt, systemPromptFor, PROMPT_VERSION } from './prompt.ts';
-import { HARNESS_VERSION } from '../version.ts';
+import { buildMessages, buildRepairPrompt, buildUserPrompt, repairSystemPrompt, systemPromptFor } from './prompt.ts';
 import { ensureDir, writeTextAtomic } from '../util/fsx.ts';
-import { sha256Short } from '../util/text.ts';
-import { ulid } from '../util/ids.ts';
 import { dirname, resolve, sep } from 'node:path';
 
 /**
@@ -59,31 +44,51 @@ import { dirname, resolve, sep } from 'node:path';
  */
 const ESCALATION_STRONG_THRESHOLD = 0.4;
 
+export type AttemptSource = 'initial' | 'repair' | 'escalation';
+
+/** What one model call did. Kept for cost accounting and for `--explain`. */
+interface Attempt {
+  n: number;
+  tier: Tier;
+  source: AttemptSource;
+  providerId: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+  latencyMs: number;
+  error?: string;
+  verification: { passed: boolean; score: number; blockers: string[]; durationMs: number } | null;
+}
+
+/** How the task ended. */
+export type RunStatus =
+  | 'local-success'
+  | 'cloud-success'
+  | 'escalated-cloud-success'
+  | 'failed'
+  | 'abandoned'
+  | 'dry-run';
+
 export interface RunOptions {
   cfg: ProtoConfig;
   dataDir: string;
   ctx: TaskContext;
   /** Write verified edits to disk. Off by default. */
   apply?: boolean;
-  /** Force a tier, bypassing the router (still recorded in the episode). */
+  /** Force a tier, bypassing the router. */
   forceTier?: Tier;
   /** Route only; make no model calls (except routing health probes). */
   dryRun?: boolean;
   /** Override local repair attempts. */
   maxRepair?: number;
-  /** Injectable providers for tests and eval. */
+  /** Injectable providers for tests. */
   localProvider?: Provider;
   cloudProvider?: Provider;
   /** Skip routing health probes (useful offline / in tests). */
   offlineRoute?: boolean;
-  /** Pre-built store (tests). */
-  store?: EpisodeStore;
-  /** Persist the episode. Off for eval runs that must not pollute the log. */
-  persist?: boolean;
   /** Progress callback for the CLI. */
   onEvent?: (event: RunEvent) => void;
-  /** Force a random draw for exploration (tests). */
-  random?: () => number;
   /** Unload the local model after the task to free RAM. */
   unloadLocalAfter?: boolean;
 }
@@ -95,8 +100,7 @@ export type RunEvent =
   | { type: 'provider-error'; tier: Tier; message: string; hint?: string }
   | { type: 'verify'; tier: Tier; passed: boolean; score: number; blockers: string[] }
   | { type: 'escalate'; from: Tier; to: Tier; reason: string }
-  | { type: 'applied'; files: string[] }
-  | { type: 'recorded'; episodeId: string; reward: number };
+  | { type: 'applied'; files: string[] };
 
 export interface RunResult {
   decision: RouteDecision;
@@ -105,8 +109,10 @@ export interface RunResult {
   finalText: string;
   /** Files written, when `apply` was set. */
   writtenFiles: string[];
-  episode: Episode | null;
-  status: Episode['outcome']['status'] | 'dry-run';
+  status: RunStatus;
+  /** Every model call made, for cost reporting. */
+  attempts: Attempt[];
+  totalCostUsd: number;
   /** True when every attempt consumed zero cloud spend. */
   usedOnlyLocal: boolean;
   warnings: string[];
@@ -114,20 +120,13 @@ export interface RunResult {
 
 export async function runTask(opts: RunOptions): Promise<RunResult> {
   const { cfg, dataDir, ctx } = opts;
-  const store = opts.store ?? new EpisodeStore(dataDir);
   const onEvent = opts.onEvent ?? ((): void => {});
   const warnings: string[] = [];
 
   // --- routing -------------------------------------------------------------
-  let spendToday = 0;
-  if (cfg.routing.cloudBudgetUsdPerDay > 0) {
-    try {
-      spendToday = store.stats().spendTodayUsd;
-    } catch {
-      warnings.push('could not read today\'s spend from the episode log; assuming $0');
-    }
-  }
-
+  // `cloudSpendTodayUsd` is 0: the harness keeps no cross-invocation spend ledger.
+  // Per-task spend is bounded by `routing.maxCloudAttempts`, which is the limit
+  // that actually matters here — a single task cannot loop.
   let decision: RouteDecision;
   try {
     decision = await routeTask({
@@ -135,8 +134,7 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
       dataDir,
       ctx,
       ...(opts.offlineRoute ? { offline: true } : {}),
-      cloudSpendTodayUsd: spendToday,
-      ...(opts.random ? { random: opts.random } : {}),
+      cloudSpendTodayUsd: 0,
     });
   } catch (err) {
     // Routing must never be the thing that stops work.
@@ -148,7 +146,6 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
       ...decision,
       tier: opts.forceTier,
       forced: true,
-      exploration: false,
       reasons: [`tier forced to "${opts.forceTier}" by the caller`, ...decision.reasons],
       reason: `forced to ${opts.forceTier}`,
     };
@@ -161,8 +158,9 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
       report: null,
       finalText: '',
       writtenFiles: [],
-      episode: null,
       status: 'dry-run',
+      attempts: [],
+      totalCostUsd: 0,
       usedOnlyLocal: true,
       warnings,
     };
@@ -181,27 +179,7 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
     cacheSystem: cfg.cloud.promptCaching,
   });
 
-  const attempts: AttemptRecord[] = [];
-  const redactionCounts: Record<string, number> = {};
-  let redactionApplied = false;
-  let charsRemoved = 0;
-
-  const recordText = (text: string, cap: number): { text: string; hash: string } => {
-    const truncated = text.length > cap;
-    const capped = truncated ? text.slice(0, cap) + '\n…[truncated by memory cap]' : text;
-    if (cfg.memory.redact) {
-      const r = redact(capped, {
-        extraPatterns: cfg.redactionPatterns,
-        maxChars: cap,
-      });
-      redactionApplied = true;
-      charsRemoved += r.charsRemoved;
-      for (const [k, v] of Object.entries(r.counts)) redactionCounts[k] = (redactionCounts[k] ?? 0) + v;
-      return { text: r.text, hash: sha256Short(r.text) };
-    }
-    return { text: capped, hash: sha256Short(capped) };
-  };
-
+  const attempts: Attempt[] = [];
   const providers = resolveProviders(opts, cfg, dataDir);
 
   // --- attempt machinery ---------------------------------------------------
@@ -210,7 +188,7 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
     tier: Tier;
     source: AttemptSource;
     messages: Message[];
-  }): Promise<{ response: ChatResponse | null; record: AttemptRecord }> => {
+  }): Promise<{ response: ChatResponse | null; attempt: Attempt }> => {
     const n = attempts.length + 1;
     onEvent({ type: 'attempt-start', tier: input.tier, source: input.source, model: input.provider.model });
     let response: ChatResponse | null = null;
@@ -239,44 +217,25 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
 
     if (response) onEvent({ type: 'attempt-end', tier: input.tier, source: input.source, response });
 
-    const promptText = input.messages.map((m) => m.content).join('\n\n');
-    const storedPrompt = cfg.memory.storePrompts
-      ? recordText(promptText, cfg.memory.maxPromptChars)
-      : undefined;
-    const storedOutput =
-      response && cfg.memory.storeTaskText
-        ? recordText(response.text, cfg.memory.maxOutputChars)
-        : response
-          ? { text: '', hash: sha256Short(response.text) }
-          : undefined;
-
-    const record: AttemptRecord = {
+    const attempt: Attempt = {
       n,
       tier: input.tier,
       source: input.source,
       providerId: input.provider.id,
       model: response?.model ?? input.provider.model,
-      ...(storedPrompt && cfg.memory.storePrompts ? { prompt: storedPrompt.text } : {}),
-      promptHash: storedPrompt?.hash ?? sha256Short(promptText),
-      promptTokens: response?.usage.inputTokens ?? 0,
+      inputTokens: response?.usage.inputTokens ?? 0,
       outputTokens: response?.usage.outputTokens ?? 0,
-      ...(response?.usage.cachedInputTokens !== undefined
-        ? { cachedInputTokens: response.usage.cachedInputTokens }
-        : {}),
       costUsd: response?.costUsd ?? 0,
       latencyMs: response?.latencyMs ?? 0,
-      finishReason: response?.finishReason ?? 'error',
-      ...(storedOutput && cfg.memory.storeTaskText ? { output: storedOutput.text } : {}),
-      outputHash: storedOutput?.hash ?? '',
       verification: null,
-      ...(error ? { error } : {}),
     };
-    if (response?.error && !error) record.error = response.error;
-    attempts.push(record);
-    return { response, record };
+    if (error !== undefined) attempt.error = error;
+    else if (response?.error) attempt.error = response.error;
+    attempts.push(attempt);
+    return { response, attempt };
   };
 
-  const verifyAttempt = async (record: AttemptRecord, text: string): Promise<VerificationReport> => {
+  const verifyAttempt = async (attempt: Attempt, text: string): Promise<VerificationReport> => {
     const report = await verifyCandidate({
       text,
       ctx,
@@ -284,17 +243,15 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
       dataDir,
       features: decision.features,
     });
-    const failedChecks = report.checks.filter((c) => !c.ok).map((c) => c.id);
-    record.verification = {
+    attempt.verification = {
       passed: report.passed,
       score: report.score,
       blockers: report.blockers,
-      failedChecks,
       durationMs: report.durationMs,
     };
     onEvent({
       type: 'verify',
-      tier: record.tier,
+      tier: attempt.tier,
       passed: report.passed,
       score: report.score,
       blockers: report.blockers,
@@ -307,10 +264,8 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
   let finalText = '';
   let escalated = false;
   let localAttempted = false;
-  let localPassed: boolean | null = null;
   let localFailed = false;
   let refusal = false;
-  let envelopeDrift = false;
 
   const isLocal = (t: Tier): boolean => t === 'local' || t === 'local-tiny';
 
@@ -321,7 +276,7 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
     let lastText = '';
 
     for (let round = 0; round <= maxRepair; round++) {
-      const { response, record } = await runAttempt({
+      const { response, attempt } = await runAttempt({
         provider: providers.local,
         tier: decision.tier,
         source: round === 0 ? 'initial' : 'repair',
@@ -331,22 +286,18 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
       if (!response || response.finishReason === 'error') {
         // Transport failure: not a model-quality signal. Break to escalation.
         localFailed = true;
-        localPassed = null;
         break;
       }
       lastText = response.text;
-      const report = await verifyAttempt(record, response.text);
+      const report = await verifyAttempt(attempt, response.text);
       if (report.checks.some((c) => c.id === 'refusal' && !c.ok)) refusal = true;
-      if (report.checks.some((c) => c.id === 'envelope-drift' && !c.ok)) envelopeDrift = true;
 
       if (report.passed) {
         finalReport = report;
         finalText = response.text;
-        localPassed = true;
         break;
       }
 
-      localPassed = false;
       localFailed = true;
       if (round < maxRepair) {
         messages = [
@@ -366,10 +317,10 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
 
     if (!finalReport && providers.cloud) {
       escalated = true;
-      // A failed local attempt is *evidence the task is harder than estimated*,
-      // so escalation bumps the cloud tier at a lower difficulty than the
-      // router's own cheap/strong boundary. This is deliberate, named, and
-      // different from CLOUD_STRONG_DIFFICULTY_THRESHOLD on purpose.
+      // A failed local attempt is *evidence the task is harder than estimated*, so
+      // escalation bumps the cloud tier at a lower difficulty than the router's own
+      // cheap/strong boundary. This is deliberate, named, and different from
+      // CLOUD_STRONG_DIFFICULTY_THRESHOLD on purpose.
       const to: Tier = decision.difficulty >= ESCALATION_STRONG_THRESHOLD ? 'cloud-strong' : 'cloud-cheap';
       onEvent({
         type: 'escalate',
@@ -379,7 +330,6 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
       });
       const cloudResult = await runCloudAttempts({
         cfg,
-        dataDir,
         tier: to,
         decision,
         baseMessages,
@@ -392,7 +342,6 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
       finalReport = cloudResult.report;
       finalText = cloudResult.text;
       refusal = refusal || cloudResult.refusal;
-      envelopeDrift = envelopeDrift || cloudResult.envelopeDrift;
     } else if (!finalReport && !providers.cloud) {
       warnings.push(
         `local attempt failed verification and no cloud tier is available (${providers.cloudUnavailable ?? 'unknown reason'}); ` +
@@ -403,7 +352,6 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
     // Cloud-first path.
     const cloudResult = await runCloudAttempts({
       cfg,
-      dataDir,
       tier: decision.tier,
       decision,
       baseMessages,
@@ -416,7 +364,6 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
     finalReport = cloudResult.report;
     finalText = cloudResult.text;
     refusal = cloudResult.refusal;
-    envelopeDrift = cloudResult.envelopeDrift;
   }
 
   // --- apply ---------------------------------------------------------------
@@ -428,9 +375,9 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
     warnings.push('refusing to write files: verification did not pass');
   }
 
-  // --- outcome & reward ----------------------------------------------------
+  // --- outcome -------------------------------------------------------------
   const tierUsed = attempts[attempts.length - 1]?.tier ?? decision.tier;
-  const status: Episode['outcome']['status'] = finalReport?.passed
+  const status: RunStatus = finalReport?.passed
     ? escalated
       ? 'escalated-cloud-success'
       : isLocal(tierUsed)
@@ -441,90 +388,6 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
       : 'abandoned';
 
   const totalCostUsd = round6(attempts.reduce((a, r) => a + r.costUsd, 0));
-  const totalLatencyMs = attempts.reduce((a, r) => a + r.latencyMs, 0);
-
-  const rewardResult = computeReward({
-    status,
-    escalated,
-    localAttempted,
-    localPassed,
-    finalScore: finalReport?.score ?? 0,
-    refusal,
-    envelopeDrift,
-    exploration: decision.exploration,
-    hadBlockers: (finalReport?.blockers.length ?? 0) > 0,
-    cloudCostUsd: totalCostUsd,
-  });
-
-  // Single conversion point: the episode records the decision and the behaviour
-  // propensity computed from that *same* decision object, so the two can never
-  // drift apart.
-  const episodeDecision = decisionFromRoute(decision);
-
-  const episode: Episode = {
-    id: ulid(),
-    schemaVersion: EPISODE_SCHEMA_VERSION,
-    ts: new Date().toISOString(),
-    harnessVersion: HARNESS_VERSION,
-    platform: `${process.platform}-${process.arch}`,
-    ...(cfg.memory.storeTaskText ? { task: recordText(ctx.task, 4000).text } : {}),
-    taskHash: sha256Short(ctx.task),
-    ...(cfg.memory.storePrompts ? { systemPrompt: recordText(system.content, 4000).text } : {}),
-    systemPromptHash: sha256Short(system.content),
-    features: decision.features,
-    vector: decision.vector,
-    vectorVersion: FEATURE_VECTOR_VERSION,
-    decision: episodeDecision,
-    environment: {
-      // Recorded from the *router's* environment, not from the provider set. They
-      // normally agree, but injected providers (tests, eval) can differ, and the
-      // episode must describe what the policy actually saw or replay becomes
-      // unsound.
-      localAvailable: decision.env.localAvailable,
-      localModel: cfg.local.model,
-      localContextWindow: cfg.local.contextWindow,
-      localModelLoaded: decision.env.localModelLoaded,
-      cloudAvailable: decision.env.cloudAvailable,
-      cloudModel: cloudTierModel(cfg, 'cloud-strong'),
-      cloudProvider: cfg.cloud.provider,
-      cloudPrice: priceFor(cfg, cloudTierModel(cfg, 'cloud-strong')),
-      configuredQualityFloor: cfg.routing.qualityFloor,
-      verifierAvailable: cfg.verify.enabled,
-      routingMode: cfg.routing.mode,
-      explorationEpsilon: cfg.routing.exploration.epsilon,
-    },
-    attempts,
-    outcome: {
-      status,
-      finalTier: tierUsed,
-      escalated,
-      localSucceeded: localAttempted ? localPassed : null,
-      totalCostUsd,
-      totalLatencyMs,
-      reward: rewardResult.reward,
-      rewardVersion: rewardResult.version,
-      behaviorPropensity: behaviorPropensity(episodeDecision, cfg.routing.exploration.epsilon),
-    },
-    consent: {
-      localTraining: cfg.train.enabled,
-      globalShare: cfg.contrib.enabled,
-    },
-    redaction: {
-      applied: redactionApplied,
-      counts: redactionCounts,
-      charsRemoved,
-    } satisfies RedactionReport,
-    tags: [PROMPT_VERSION],
-  };
-
-  if (opts.persist !== false && cfg.memory.enabled) {
-    try {
-      store.appendBounded(episode, cfg.memory.maxShardBytes);
-      onEvent({ type: 'recorded', episodeId: episode.id, reward: rewardResult.reward });
-    } catch (err) {
-      warnings.push(`failed to persist episode: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
 
   if (opts.unloadLocalAfter && providers.local.kind === 'local') {
     await maybeUnload(providers.local);
@@ -535,8 +398,9 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
     report: finalReport,
     finalText,
     writtenFiles,
-    episode,
     status,
+    attempts,
+    totalCostUsd,
     usedOnlyLocal: totalCostUsd === 0,
     warnings,
   };
@@ -548,7 +412,6 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
 
 async function runCloudAttempts(input: {
   cfg: ProtoConfig;
-  dataDir: string;
   tier: Tier;
   decision: RouteDecision;
   baseMessages: Message[];
@@ -556,23 +419,22 @@ async function runCloudAttempts(input: {
   providers: ProviderBundle;
   runAttempt: (i: { provider: Provider; tier: Tier; source: AttemptSource; messages: Message[] }) => Promise<{
     response: ChatResponse | null;
-    record: AttemptRecord;
+    attempt: Attempt;
   }>;
-  verifyAttempt: (record: AttemptRecord, text: string) => Promise<VerificationReport>;
+  verifyAttempt: (attempt: Attempt, text: string) => Promise<VerificationReport>;
   warnings: string[];
-}): Promise<{ report: VerificationReport | null; text: string; refusal: boolean; envelopeDrift: boolean }> {
+}): Promise<{ report: VerificationReport | null; text: string; refusal: boolean }> {
   const { cfg, decision, providers } = input;
   let report: VerificationReport | null = null;
   let text = '';
   let refusal = false;
-  let envelopeDrift = false;
 
   const maxAttempts = Math.max(1, cfg.routing.maxCloudAttempts);
   let tier: Tier = input.tier;
 
   for (let i = 0; i < maxAttempts; i++) {
-    // Escalate the cloud tier on a retry only when the task looks hard; otherwise
-    // a cheap model retry is the cost-appropriate response.
+    // Escalate the cloud tier on a retry only when the task looks hard; otherwise a
+    // cheap model retry is the cost-appropriate response.
     if (i > 0) tier = decision.difficulty >= ESCALATION_STRONG_THRESHOLD ? 'cloud-strong' : 'cloud-cheap';
     const provider = providers.cloudFor(tier);
     if (!provider) {
@@ -595,7 +457,7 @@ async function runCloudAttempts(input: {
           },
         ];
 
-    const { response, record } = await input.runAttempt({
+    const { response, attempt } = await input.runAttempt({
       provider,
       tier,
       source: i === 0 ? 'escalation' : 'repair',
@@ -603,20 +465,19 @@ async function runCloudAttempts(input: {
     });
 
     if (!response || response.finishReason === 'error') {
-      input.warnings.push(`cloud attempt ${i + 1} failed at the transport level${record.error ? `: ${record.error}` : ''}`);
+      input.warnings.push(`cloud attempt ${i + 1} failed at the transport level${attempt.error ? `: ${attempt.error}` : ''}`);
       continue;
     }
     text = response.text;
-    report = await input.verifyAttempt(record, response.text);
+    report = await input.verifyAttempt(attempt, response.text);
     if (report.checks.some((c) => c.id === 'refusal' && !c.ok)) refusal = true;
-    if (report.checks.some((c) => c.id === 'envelope-drift' && !c.ok)) envelopeDrift = true;
-    if (report.passed) return { report, text, refusal, envelopeDrift };
+    if (report.passed) return { report, text, refusal };
   }
 
   if (report && !report.passed) {
     input.warnings.push('the cloud answer also failed verification; returning it as an unverified best effort');
   }
-  return { report, text, refusal, envelopeDrift };
+  return { report, text, refusal };
 }
 
 /* ------------------------------------------------------------------ */

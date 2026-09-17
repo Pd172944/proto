@@ -18,7 +18,6 @@ import type { RunEvent } from '../src/harness/loop.ts';
 import { MockProvider, alwaysFailingMock } from '../src/providers/mock.ts';
 import type { ChatRequest, ChatResponse, Provider } from '../src/providers/types.ts';
 import { computeCost } from '../src/providers/types.ts';
-import { EpisodeStore } from '../src/memory/store.ts';
 import { writeSecret } from '../src/config/load.ts';
 import type { ProtoConfig } from '../src/config/schema.ts';
 import { tempDir, testConfig } from './helpers.ts';
@@ -78,31 +77,26 @@ function ctxFor(workspace: string): { task: string; workspace: string; files: Ar
 }
 
 describe('runTask: local success path', () => {
-  it('routes to local, verifies, records a positive label, and writes nothing by default', async () => {
+  it('routes to local, verifies, and writes nothing by default', async () => {
     const { dir, workspace, cfg } = setup({ cloudKey: false });
-    const store = new EpisodeStore(dir);
     const result = await runTask({
       cfg,
       dataDir: dir,
       ctx: ctxFor(workspace),
       localProvider: new MockProvider({ id: 'mock-local', kind: 'local' }),
       offlineRoute: true,
-      store,
     });
 
     assert.equal(result.status, 'local-success');
     assert.equal(result.writtenFiles.length, 0);
-    assert.equal(result.episode?.outcome.localSucceeded, true);
-    assert.equal(result.episode?.outcome.escalated, false);
-    assert.equal(result.episode?.outcome.totalCostUsd, 0);
-    assert.ok((result.episode?.outcome.reward ?? 0) > 1, 'a clean local win should be strongly rewarded');
-    assert.equal(result.episode?.attempts.length, 1);
-    assert.equal(result.episode?.attempts[0]?.verification?.passed, true);
+    assert.equal(result.attempts.length, 1);
+    assert.equal(result.attempts[0]?.tier, 'local');
+    assert.equal(result.attempts[0]?.verification?.passed, true);
+    assert.equal(result.totalCostUsd, 0);
+    assert.equal(result.usedOnlyLocal, true);
 
     // The workspace must be untouched.
     assert.match(readFileSync(join(workspace, 'prices.py'), 'utf8'), /range\(len\(items\) \+ 1\)/);
-    // And the episode must be on disk.
-    assert.equal(store.readAll().length, 1);
   });
 
   it('emits progress events that a UI can render', async () => {
@@ -120,7 +114,6 @@ describe('runTask: local success path', () => {
     assert.ok(types.includes('route'));
     assert.ok(types.includes('attempt-start'));
     assert.ok(types.includes('verify'));
-    assert.ok(types.includes('recorded'));
   });
 
   it('writes verified edits only when apply is requested', async () => {
@@ -164,7 +157,6 @@ describe('runTask: local success path', () => {
 describe('runTask: escalation path', () => {
   it('escalates a failed local attempt to the cloud and records the pair', async () => {
     const { dir, workspace, cfg } = setup();
-    const store = new EpisodeStore(dir);
     const result = await runTask({
       cfg,
       dataDir: dir,
@@ -173,19 +165,14 @@ describe('runTask: escalation path', () => {
       cloudProvider: new MockProvider({ id: 'mock-cloud', kind: 'cloud', model: 'mock-strong' }),
       offlineRoute: true,
       maxRepair: 0,
-      store,
     });
 
     assert.equal(result.status, 'escalated-cloud-success', JSON.stringify(result.warnings));
-    assert.equal(result.episode?.outcome.escalated, true);
-    assert.equal(result.episode?.outcome.localSucceeded, false);
-    assert.ok((result.episode?.attempts.length ?? 0) >= 2);
-    assert.equal(result.episode?.attempts[0]?.tier.startsWith('local'), true);
-    assert.equal(result.episode?.attempts[1]?.tier.startsWith('cloud'), true);
-    // The failed local answer must be retained: it is the DPO "rejected" side.
-    assert.ok(result.episode?.attempts[0]?.output);
-    assert.equal(result.episode?.attempts[0]?.verification?.passed, false);
-    assert.equal(result.episode?.attempts[1]?.verification?.passed, true);
+    assert.ok(result.attempts.length >= 2);
+    assert.equal(result.attempts[0]?.tier.startsWith('local'), true);
+    assert.equal(result.attempts[1]?.tier.startsWith('cloud'), true);
+    assert.equal(result.attempts[0]?.verification?.passed, false);
+    assert.equal(result.attempts[1]?.verification?.passed, true);
   });
 
   it('fails cleanly and explains when local fails and no cloud is configured', async () => {
@@ -200,7 +187,7 @@ describe('runTask: escalation path', () => {
     });
     assert.equal(result.status, 'failed');
     assert.ok(result.warnings.some((w) => /no cloud tier is available/.test(w)));
-    assert.equal(result.episode?.outcome.localSucceeded, false);
+    assert.equal(result.attempts[0]?.tier.startsWith('local'), true);
   });
 
   it('treats a transport failure as an outage, not as the model being wrong', async () => {
@@ -228,9 +215,9 @@ describe('runTask: escalation path', () => {
       maxRepair: 0,
     });
 
-    const first = result.episode?.attempts[0];
+    const first = result.attempts[0];
     assert.ok(first?.error, 'the transport error must be recorded on the attempt');
-    // No local verification happened, so there must be no training label.
+    // A transport failure is an outage: verification never ran.
     assert.equal(first?.verification, null);
   });
 });
@@ -250,8 +237,7 @@ describe('runTask: forcing and dry runs', () => {
       offlineRoute: true,
     });
     assert.equal(result.decision.forced, true);
-    assert.equal(result.episode?.outcome.finalTier, 'cloud-strong');
-    assert.equal(result.episode?.outcome.localSucceeded, null, 'local was never attempted, so there is no label');
+    assert.equal(result.attempts[0]?.tier, 'cloud-strong');
     assert.equal(local.history.length, 0);
     assert.equal(cloud.history.length, 1);
   });
@@ -259,7 +245,6 @@ describe('runTask: forcing and dry runs', () => {
   it('makes no model calls at all in dry-run mode', async () => {
     const { dir, workspace, cfg } = setup();
     const local = new MockProvider({ id: 'mock-local' });
-    const store = new EpisodeStore(dir);
     const result = await runTask({
       cfg,
       dataDir: dir,
@@ -267,98 +252,10 @@ describe('runTask: forcing and dry runs', () => {
       localProvider: local,
       offlineRoute: true,
       dryRun: true,
-      store,
     });
     assert.equal(result.status, 'dry-run');
-    assert.equal(result.episode, null);
+    assert.equal(result.attempts.length, 0);
     assert.equal(local.history.length, 0);
-    assert.equal(store.readAll().length, 0, 'a dry run must not pollute the episode log');
-  });
-
-  it('does not persist when asked not to', async () => {
-    const { dir, workspace, cfg } = setup({ cloudKey: false });
-    const store = new EpisodeStore(dir);
-    await runTask({
-      cfg,
-      dataDir: dir,
-      ctx: ctxFor(workspace),
-      localProvider: new MockProvider({ id: 'mock-local' }),
-      offlineRoute: true,
-      persist: false,
-      store,
-    });
-    assert.equal(store.readAll().length, 0);
-  });
-});
-
-describe('runTask: data hygiene', () => {
-  it('redacts secrets before they reach the episode log', async () => {
-    const { dir, workspace, cfg } = setup({ cloudKey: false });
-    const store = new EpisodeStore(dir);
-    const secret = 'sk-proj-abcdefghijklmnopqrstuvwxyz012345';
-    await runTask({
-      cfg,
-      dataDir: dir,
-      ctx: {
-        task: `${EASY_TASK} Also my key is ${secret} and my email is dev@example.com`,
-        workspace,
-        files: [{ path: 'prices.py', content: LOOP_FILE }],
-      },
-      localProvider: new MockProvider({ id: 'mock-local' }),
-      offlineRoute: true,
-      store,
-    });
-
-    const raw = readFileSync(store.shards()[0] as string, 'utf8');
-    assert.ok(!raw.includes(secret), 'the API key must never be written to disk');
-    assert.ok(!raw.includes('dev@example.com'));
-    assert.ok(raw.includes('[REDACTED:api-key]'));
-    const ep = store.readAll()[0];
-    assert.equal(ep?.redaction.applied, true);
-    assert.ok(Object.keys(ep?.redaction.counts ?? {}).length > 0);
-  });
-
-  it('omits task text and prompts when configured to', async () => {
-    const { dir, workspace } = setup({ cloudKey: false });
-    const base = testConfig(dir);
-    const cfg: ProtoConfig = {
-      ...base,
-      cloud: { ...base.cloud, enabled: false },
-      memory: { ...base.memory, storeTaskText: false, storePrompts: false },
-    };
-    const store = new EpisodeStore(dir);
-    const ep = (
-      await runTask({
-        cfg,
-        dataDir: dir,
-        ctx: ctxFor(workspace),
-        localProvider: new MockProvider({ id: 'mock-local' }),
-        offlineRoute: true,
-        store,
-      })
-    ).episode;
-
-    assert.equal(ep?.task, undefined);
-    assert.equal(ep?.systemPrompt, undefined);
-    assert.ok(ep?.taskHash);
-    assert.equal(ep?.attempts[0]?.prompt, undefined);
-    assert.equal(ep?.attempts[0]?.output, undefined);
-    assert.ok(ep?.attempts[0]?.outputHash, 'hashes remain so dedup still works');
-  });
-
-  it('records the router environment that the decision was actually made under', async () => {
-    const { dir, workspace, cfg } = setup({ cloudKey: false });
-    const result = await runTask({
-      cfg,
-      dataDir: dir,
-      ctx: ctxFor(workspace),
-      localProvider: new MockProvider({ id: 'mock-local' }),
-      offlineRoute: true,
-    });
-    assert.equal(result.episode?.environment.cloudAvailable, false);
-    assert.equal(result.episode?.environment.localAvailable, true);
-    assert.equal(result.episode?.environment.verifierAvailable, true);
-    assert.equal(result.episode?.features.taskClass, 'bugfix-local');
   });
 });
 

@@ -21,17 +21,10 @@
  *    cloud regardless of the score. A silent auth bug or a wrong migration
  *    plan costs far more than the API call, and neither is reliably catchable
  *    by the verifier.
- *  - **Exploration** deliberately overrides the decision for a small fraction of
- *    low-risk tasks *only when a verifier exists*. Without it the router never
- *    observes what local would have done on tasks it routes away, and the
- *    learned scorer can never be debiased. This is the exploration/exploitation
- *    trade-off, made explicit and bounded.
  */
 
 import type { ProtoConfig, Price } from '../config/schema.ts';
-import { heuristicScore, blendWithPrior } from './heuristic.ts';
-import { toVector } from './features.ts';
-import type { LogisticScorer } from './learned.ts';
+import { heuristicScore } from './heuristic.ts';
 import type { RouteDecision, RouterEnvironmentSnapshot, TaskClass, TaskContext, TaskFeatures, Tier } from './types.ts';
 
 /** Classes where a wrong-but-plausible answer is too expensive to risk locally. */
@@ -66,8 +59,6 @@ export interface RouterEnvironment {
   /** Remaining cloud spend for today, USD. */
   cloudBudgetRemainingUsd: number;
   price: Price;
-  /** Injectable randomness so tests are deterministic. */
-  random?: () => number;
 }
 
 export interface RouterInputs {
@@ -75,7 +66,6 @@ export interface RouterInputs {
   features: TaskFeatures;
   cfg: ProtoConfig;
   env: RouterEnvironment;
-  scorer?: LogisticScorer | null;
 }
 
 /** Rough decode speed by parameter count on Apple Silicon, tokens/sec. */
@@ -99,44 +89,21 @@ export function estimateLocalTokensPerSec(model: string): number {
 
 export function decideRoute(input: RouterInputs): RouteDecision {
   const { ctx, features, cfg, env } = input;
-  const vector = toVector(features);
-  const random = env.random ?? Math.random;
 
   const heur = heuristicScore(features);
   const pHeuristic = heur.pLocalSuccess;
   const difficulty = heur.difficulty;
 
   // --- probability estimate ------------------------------------------------
-  let pLocal = pHeuristic;
-  let scorerUsed: RouteDecision['scorer'] = 'heuristic';
+  // Purely heuristic. This project routes between a local and a cloud model and
+  // nothing else: there is no logged-episode corpus, no trained weights, and no
+  // learning loop, so the score comes from hand-written rules and the feature
+  // vector is used only for the cost estimate and for diagnostics.
+  const pLocal = pHeuristic;
   const reasons: string[] = [];
   const vetoes: string[] = [];
 
-  const trained = input.scorer && input.scorer.sampleCount > 0 ? input.scorer : null;
-  if (cfg.routing.mode !== 'heuristic' && trained) {
-    const pLearned = trained.predict(vector);
-    if (cfg.routing.mode === 'learned') {
-      pLocal = pLearned;
-      scorerUsed = 'learned';
-      reasons.push(
-        `learned scorer: p(local)=${pLearned.toFixed(3)} from ${trained.sampleCount} logged episodes`,
-      );
-    } else {
-      const blended = blendWithPrior(pLearned, pHeuristic, trained.sampleCount);
-      pLocal = blended.p;
-      scorerUsed = 'hybrid';
-      reasons.push(
-        `hybrid scorer: learned ${pLearned.toFixed(3)} blended with heuristic ${pHeuristic.toFixed(3)} ` +
-          `(learned weight ${blended.learnedWeight.toFixed(2)} at n=${trained.sampleCount})`,
-      );
-    }
-  } else {
-    reasons.push(`heuristic scorer: p(local)=${pHeuristic.toFixed(3)} (no usable learned weights yet)`);
-  }
-  if (cfg.routing.mode === 'learned' && !trained) {
-    reasons.push('routing.mode=learned but fewer than the minimum labelled episodes exist; falling back to heuristic');
-  }
-
+  reasons.push(`heuristic scorer: p(local)=${pHeuristic.toFixed(3)}`);
   reasons.push(`difficulty ${difficulty.toFixed(3)} for class "${features.taskClass}"`);
 
   // --- cost & latency -------------------------------------------------------
@@ -231,7 +198,7 @@ export function decideRoute(input: RouterInputs): RouteDecision {
 
   let tier: Tier;
   let forced = false;
-  let exploration = false;
+
 
   const localWinsOnQuality = pLocal >= floor;
   const localWinsOnLatency = localLatencyMs <= cloudLatencyMs * cfg.routing.latencyToleranceFactor;
@@ -271,26 +238,6 @@ export function decideRoute(input: RouterInputs): RouteDecision {
     );
   }
 
-  // --- exploration override -------------------------------------------------
-  if (
-    cfg.routing.exploration.enabled &&
-    env.verifierAvailable &&
-    tier !== 'local' &&
-    tier !== 'local-tiny' &&
-    !localVetoed &&
-    !forced &&
-    difficulty <= cfg.routing.exploration.maxDifficultyForExploration &&
-    features.estInputTokens <= cfg.routing.exploration.maxTokensForExploration &&
-    random() < cfg.routing.exploration.epsilon
-  ) {
-    tier = 'local';
-    exploration = true;
-    reasons.push(
-      `exploration: sending this task local (epsilon=${cfg.routing.exploration.epsilon}) to observe the ` +
-        `counterfactual; a verifier will catch failure`,
-    );
-  }
-
   const expected = {
     localCostUsd: localElectricityUsd,
     cloudCostUsd: round6(cloudCostUsd),
@@ -298,7 +245,7 @@ export function decideRoute(input: RouterInputs): RouteDecision {
     cloudLatencyMs,
   };
 
-  const reason = buildReason(tier, pLocal, difficulty, features, { exploration, forced });
+  const reason = buildReason(tier, pLocal, difficulty, features, { forced });
 
   const envSnapshot: RouterEnvironmentSnapshot = {
     localEnabled: env.localEnabled,
@@ -322,13 +269,9 @@ export function decideRoute(input: RouterInputs): RouteDecision {
     difficulty,
     taskClass: features.taskClass,
     expected,
-    exploration,
     vetoes,
     unverified: !env.verifierAvailable,
     features,
-    vector,
-    vectorVersion: 1,
-    scorer: scorerUsed,
     forced,
     env: envSnapshot,
   };
@@ -339,7 +282,7 @@ function buildReason(
   p: number,
   difficulty: number,
   f: TaskFeatures,
-  flags: { exploration: boolean; forced: boolean },
+  flags: { forced: boolean },
 ): string {
   const pct = `${Math.round(p * 100)}%`;
   const scope = f.fileCount === 0 ? 'no files in scope' : `${f.fileCount} file(s)`;
@@ -347,11 +290,9 @@ function buildReason(
     case 'local-tiny':
       return `very easy local task (difficulty ${difficulty.toFixed(2)}, ${scope}) -> tiny local model [${pct} local prior]`;
     case 'local':
-      return flags.exploration
-        ? `exploration attempt on the local model (difficulty ${difficulty.toFixed(2)}, ${scope})`
-        : flags.forced
-          ? `local model only option (difficulty ${difficulty.toFixed(2)}, ${scope})`
-          : `easy enough for the local model (difficulty ${difficulty.toFixed(2)}, ${scope}) [${pct} local prior]`;
+      return flags.forced
+        ? `local model only option (difficulty ${difficulty.toFixed(2)}, ${scope})`
+        : `easy enough for the local model (difficulty ${difficulty.toFixed(2)}, ${scope}) [${pct} local prior]`;
     case 'cloud-cheap':
       return `easy-to-moderate but cloud-routed (difficulty ${difficulty.toFixed(2)}, ${scope}) -> cheaper cloud model`;
     case 'cloud-strong':

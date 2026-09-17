@@ -172,10 +172,6 @@ describe('config', () => {
 
   it('ships a sane default configuration', () => {
     assert.equal(DEFAULT_CONFIG.verify.enabled, true);
-    assert.equal(DEFAULT_CONFIG.memory.redact, true);
-    assert.equal(DEFAULT_CONFIG.train.enabled, false, 'training must be opt-in');
-    assert.equal(DEFAULT_CONFIG.contrib.enabled, false, 'sharing must be opt-in');
-    assert.equal(DEFAULT_CONFIG.contrib.shareCode, false);
     assert.ok(DEFAULT_CONFIG.routing.qualityFloor < DEFAULT_CONFIG.routing.qualityFloorUnverified);
     assert.ok(DEFAULT_CONFIG.routing.qualityFloorReadOnly <= DEFAULT_CONFIG.routing.qualityFloor);
   });
@@ -207,8 +203,8 @@ describe('config', () => {
     // the delta of the config it was handed.
     const dirA = tempDir();
     const cfgA = testConfig(dirA);
-    const path = saveConfig({ ...cfgA, train: { ...cfgA.train, enabled: true } }, dirA);
-    assert.deepEqual(readJsonOrNull<Record<string, unknown>>(path), { version: 1, train: { enabled: true } });
+    const path = saveConfig({ ...cfgA, verify: { ...cfgA.verify, runTests: true } }, dirA);
+    assert.deepEqual(readJsonOrNull<Record<string, unknown>>(path), { version: 1, verify: { runTests: true } });
 
     // A nested override keeps only the changed leaf.
     const dirB = tempDir();
@@ -218,7 +214,7 @@ describe('config', () => {
 
     // And the effective config is still complete when read back.
     const reloaded = loadConfig({ dataDir: dirA }).config;
-    assert.equal(reloaded.train.enabled, true);
+    assert.equal(reloaded.verify.runTests, true);
     assert.equal(reloaded.local.model, cfgA.local.model);
     const reloadedB = loadConfig({ dataDir: dirB }).config;
     assert.equal(reloadedB.routing.qualityFloor, 0.8);
@@ -278,21 +274,21 @@ describe('config', () => {
   it('applies environment overrides for scripting', () => {
     const dir = tempDir();
     const prevModel = process.env['PROTO_LOCAL_MODEL'];
-    const prevMode = process.env['PROTO_ROUTING_MODE'];
+    const prevFloor = process.env['PROTO_QUALITY_FLOOR'];
     process.env['PROTO_LOCAL_MODEL'] = 'llama3.2:3b';
-    process.env['PROTO_ROUTING_MODE'] = 'heuristic';
+    process.env['PROTO_QUALITY_FLOOR'] = '0.42';
     try {
       const cfg = testConfig(dir);
       // testConfig bypasses env overrides (it post-processes), so verify via loadConfig.
       const loaded = loadConfig({ dataDir: dir }).config;
       assert.equal(loaded.local.model, 'llama3.2:3b');
-      assert.equal(loaded.routing.mode, 'heuristic');
+      assert.equal(loaded.routing.qualityFloor, 0.42);
       assert.ok(cfg.local.model.length > 0);
     } finally {
       if (prevModel === undefined) delete process.env['PROTO_LOCAL_MODEL'];
       else process.env['PROTO_LOCAL_MODEL'] = prevModel;
-      if (prevMode === undefined) delete process.env['PROTO_ROUTING_MODE'];
-      else process.env['PROTO_ROUTING_MODE'] = prevMode;
+      if (prevFloor === undefined) delete process.env['PROTO_QUALITY_FLOOR'];
+      else process.env['PROTO_QUALITY_FLOOR'] = prevFloor;
     }
   });
 });

@@ -35,7 +35,6 @@ import type { ApprovalRequest } from '../tools/types.ts';
 import { runAgentTurn } from '../agent/loop.ts';
 import { routeTask } from '../router/index.ts';
 import type { RouteDecision, Tier } from '../router/types.ts';
-import { EpisodeStore } from '../memory/store.ts';
 import type { AgentEvent } from '../agent/loop.ts';
 import { Session, listSessions, loadSession, latestSession, saveSession } from '../agent/session.ts';
 import { productionEdits } from '../agent/edits.ts';
@@ -347,14 +346,6 @@ export const codeCommand: Command = {
     let decision: RouteDecision | null = null;
     let tier: Tier | null = null;
 
-    const readSpendToday = (): number => {
-      try {
-        return new EpisodeStore(ctx.dataDir).stats().spendTodayUsd;
-      } catch {
-        return 0;
-      }
-    };
-
     /** Route `task` and return the resulting provider choice, or null if routing is off. */
     const routeFor = async (task: string, files: Array<{ path: string; content: string }> = []): Promise<ProviderChoice | null> => {
       if (!routingEnabled) return null;
@@ -363,7 +354,9 @@ export const codeCommand: Command = {
         dataDir: ctx.dataDir,
         ctx: { task, files, workspace },
         verifierAvailable: true,
-        cloudSpendTodayUsd: readSpendToday(),
+        // No cross-invocation spend ledger: the harness keeps none. Per-session
+        // spend is bounded by --budget-usd, which the session tracks itself.
+        cloudSpendTodayUsd: 0,
       });
       tier = decision.tier;
       return providerForTier(tier);

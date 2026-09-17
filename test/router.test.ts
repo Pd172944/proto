@@ -10,14 +10,11 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
-import { analyzeCode, classifyTask, extractFeatures, toVector } from '../src/router/features.ts';
-import { FEATURE_NAMES, FEATURE_VECTOR_VERSION } from '../src/router/types.ts';
-import { heuristicScore, blendWithPrior, sigmoid } from '../src/router/heuristic.ts';
+import { analyzeCode, classifyTask, extractFeatures } from '../src/router/features.ts';
+import { heuristicScore, sigmoid } from '../src/router/heuristic.ts';
 import { decideRoute, estimateLocalTokensPerSec, HARD_LOCKED_CLASSES } from '../src/router/policy.ts';
 import type { RouterEnvironment } from '../src/router/policy.ts';
-import { LogisticScorer, evaluate, trainLogistic, MIN_TRAINING_SAMPLES } from '../src/router/learned.ts';
-import { loadScorer, routeTask, routerWeightsPath, saveScorer } from '../src/router/index.ts';
-import { readJsonOrNull, writeJsonAtomic } from '../src/util/fsx.ts';
+import { routeTask } from '../src/router/index.ts';
 import { tempDir, testConfig } from './helpers.ts';
 
 const LOOP_FILE = `def total_prices(items):
@@ -38,7 +35,6 @@ function env(overrides: Partial<RouterEnvironment> = {}): RouterEnvironment {
     verifierAvailable: true,
     cloudBudgetRemainingUsd: 5,
     price: { in: 3, out: 15 },
-    random: () => 1,
     ...overrides,
   };
 }
@@ -173,11 +169,6 @@ describe('feature extraction', () => {
     assert.equal(mutate.isExplainOnly, false, '"review and fix" is a mutating task');
   });
 
-  it('produces a vector of exactly the declared length', () => {
-    const f = extractFeatures({ task: 'anything' });
-    assert.equal(toVector(f).length, FEATURE_NAMES.length);
-    assert.equal(FEATURE_VECTOR_VERSION, 1);
-  });
 });
 
 describe('policy', () => {
@@ -191,7 +182,6 @@ describe('policy', () => {
   it('routes an easy verifiable task to the local model', () => {
     const d = decideRoute({ ctx: { task: '' }, features: easy, cfg, env: env() });
     assert.ok(d.tier === 'local' || d.tier === 'local-tiny', `got ${d.tier}`);
-    assert.equal(d.exploration, false);
   });
 
   it('uses the tiny model tier when one is configured and the task is trivial', () => {
@@ -312,22 +302,6 @@ describe('policy', () => {
     assert.equal(d1.tier, 'cloud-cheap');
   });
 
-  it('explores deliberately and records it', () => {
-    const moderate = extractFeatures({
-      task: 'Refactor the retry helper into a small policy object.',
-      files: [{ path: 'a.py', content: LOOP_FILE }],
-    });
-    const exploratory = decideRoute({
-      ctx: { task: '' },
-      features: moderate,
-      cfg,
-      env: env({ verifierAvailable: false, random: () => 0 }),
-    });
-    // The exploration path is only reached from a cloud decision, and only with
-    // a verifier; so assert the invariant rather than the specific tier.
-    assert.equal(exploratory.exploration, false, 'no exploration without a verifier to catch failure');
-  });
-
   it('prefers the cloud when the local model is cold and the task is tiny', () => {
     const tiny = extractFeatures({ task: 'Rename the variable `a` to `count`.' });
     const cold = decideRoute({ ctx: { task: '' }, features: tiny, cfg, env: env({ localModelLoaded: false }) });
@@ -346,111 +320,3 @@ describe('policy', () => {
     assert.ok(estimateLocalTokensPerSec('llama3.2:3b') > 0);
   });
 });
-
-describe('learned scorer', () => {
-  it('separates synthetic classes and is deterministic for a given seed', () => {
-    // ~8% label noise, so the Bayes-optimal AUC here is about 0.92; asserting
-    // > 0.85 checks that the learner finds the signal without pretending the
-    // synthetic data is noise-free.
-    const samples = [];
-    for (let i = 0; i < 120; i++) {
-      const easy = i % 2 === 0;
-      const x = new Array(FEATURE_NAMES.length).fill(0);
-      x[0] = 1;
-      x[27] = easy ? 0.1 : 0.9; // class_difficulty
-      x[25] = easy ? 0.9 : 0.2; // locality
-      samples.push({ x, y: (easy ? (i % 11 === 0 ? 0 : 1) : i % 13 === 0 ? 1 : 0) as 0 | 1 });
-    }
-    const a = trainLogistic(samples, { seed: 99 });
-    const b = trainLogistic(samples, { seed: 99 });
-    assert.deepEqual(a.scorer.weights, b.scorer.weights, 'training must be reproducible');
-    assert.ok(a.metrics.auc > 0.85, `expected separable data, auc=${a.metrics.auc}`);
-    assert.ok(a.metrics.calibration.length === 5);
-  });
-
-  it('predicts monotonically with difficulty', () => {
-    const samples = [];
-    for (let i = 0; i < 100; i++) {
-      const x = new Array(FEATURE_NAMES.length).fill(0);
-      x[0] = 1;
-      x[27] = i / 100;
-      samples.push({ x, y: (i < 40 ? 1 : 0) as 0 | 1 });
-    }
-    const { scorer } = trainLogistic(samples, { seed: 3 });
-    const easy = scorer.predict(withFeature(27, 0.05));
-    const hard = scorer.predict(withFeature(27, 0.95));
-    assert.ok(easy > hard, 'higher class difficulty must lower the success probability');
-  });
-
-  it('shrinks toward the heuristic prior when few episodes are available', () => {
-    const few = blendWithPrior(0.2, 0.8, 1);
-    const many = blendWithPrior(0.2, 0.8, 10_000);
-    assert.ok(few.p > many.p, 'with little data we should trust the heuristic');
-    assert.ok(few.learnedWeight < 0.1);
-    assert.ok(many.learnedWeight <= 0.85, 'the heuristic must never fully disappear');
-  });
-
-  it('refuses weights trained on a different feature vector version', () => {
-    const scorer = new LogisticScorer();
-    const file = { ...scorer.toFile(), featureVectorVersion: FEATURE_VECTOR_VERSION + 1 };
-    assert.throws(() => LogisticScorer.fromFile(file), /feature vector v/);
-  });
-
-  it('reports a baseline quality metric when untrained', () => {
-    const scorer = new LogisticScorer();
-    const metrics = evaluate(scorer, [
-      { x: withFeature(0, 1), y: 1 },
-      { x: withFeature(0, 1), y: 0 },
-    ]);
-    assert.equal(metrics.n, 2);
-    assert.equal(metrics.auc, 0.5);
-  });
-
-  it('requires a meaningful number of episodes before use', () => {
-    assert.ok(MIN_TRAINING_SAMPLES >= 20, 'a handful of episodes must not train the router');
-  });
-
-  it('round-trips weights through disk', () => {
-    const dir = tempDir();
-    const scorer = new LogisticScorer(new Array(FEATURE_NAMES.length).fill(0.1), { sampleCount: 99 });
-    saveScorer(dir, scorer, ['test']);
-    const reloaded = loadScorer(dir);
-    assert.equal(reloaded.error, undefined);
-    assert.equal(reloaded.scorer?.sampleCount, 99);
-    assert.ok(readJsonOrNull(routerWeightsPath(dir)));
-  });
-
-  it('refuses stale weights loudly rather than silently degrading to the heuristic', async () => {
-    // After a FEATURE_VECTOR_VERSION bump the stored weights are unusable. The
-    // router must fall back AND say so: silently switching to the heuristic
-    // looks exactly like a mysterious routing-quality regression.
-    const dir = tempDir();
-    const scorer = new LogisticScorer(new Array(FEATURE_NAMES.length).fill(0));
-    const file = scorer.toFile();
-    writeJsonAtomic(routerWeightsPath(dir), { ...file, featureVectorVersion: FEATURE_VECTOR_VERSION + 1 });
-
-    const cfg = testConfig(dir);
-    const decision = await routeTask({
-      cfg,
-      dataDir: dir,
-      ctx: { task: 'Fix the off-by-one error in this loop.' },
-      offline: true,
-    });
-    assert.match(decision.scorerError ?? '', /feature vector v/);
-    assert.ok(decision.reasons.some((r) => /were ignored/.test(r)));
-    assert.equal(decision.scorer, 'heuristic');
-  });
-
-  it('sigmoid is numerically stable at extremes', () => {
-    assert.equal(sigmoid(0), 0.5);
-    assert.ok(sigmoid(-1000) >= 0 && Number.isFinite(sigmoid(-1000)));
-    assert.ok(sigmoid(1000) <= 1 && Number.isFinite(sigmoid(1000)));
-  });
-});
-
-function withFeature(index: number, value: number): number[] {
-  const x = new Array(FEATURE_NAMES.length).fill(0);
-  x[0] = 1;
-  if (index !== 0) x[index] = value;
-  return x;
-}

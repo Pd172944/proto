@@ -1,7 +1,7 @@
 /**
  * Router types. These are the shared vocabulary between feature extraction,
  * scoring, policy, the episode log and the training datasets, so they change
- * only with an explicit version bump (see FEATURE_VECTOR_VERSION).
+ * and is a pure function of the task, so it can be validated offline.
  */
 
 export type Tier = 'local-tiny' | 'local' | 'cloud-cheap' | 'cloud-strong';
@@ -87,64 +87,7 @@ export interface TaskFeatures {
   signals: string[];
 }
 
-/**
- * Bump when the numeric vector changes meaning. Stored in the weights file and
- * in every episode so that datasets from different versions are never mixed.
- */
-export const FEATURE_VECTOR_VERSION = 1;
 
-/**
- * The exact ordered feature names for the learned scorer. Adding a feature
- * requires bumping FEATURE_VECTOR_VERSION, because old weights would otherwise
- * be silently applied to a shifted vector.
- */
-export const FEATURE_NAMES = [
-  'bias',
-  'log_input_tokens',
-  'log_output_tokens',
-  'log_file_count',
-  'log_changed_lines',
-  'log_loop_count',
-  'log_func_count',
-  'log_max_nesting',
-  'log_branch_count',
-  'has_async',
-  'has_concurrency',
-  'has_types',
-  'has_error_handling',
-  'has_tests_in_scope',
-  'has_stack_trace',
-  'has_repro_steps',
-  'has_acceptance_criteria',
-  'has_external_api',
-  'has_perf_language',
-  'has_security_language',
-  'has_migration_language',
-  'is_question',
-  'is_explain_only',
-  'log_constraint_count',
-  'ambiguity',
-  'locality',
-  'mentions_symbol',
-  'class_difficulty',
-  'class_is_local_edit',
-  'class_is_bugfix_local',
-  'class_is_validation',
-  'class_is_rename_or_format',
-  'class_is_tests',
-  'class_is_docs_or_explain',
-  'class_is_refactor_multi',
-  'class_is_feature_new',
-  'class_is_perf',
-  'class_is_debug_unknown',
-  'class_is_concurrency',
-  'class_is_security',
-  'class_is_migration',
-  'class_is_architecture',
-  'class_is_algorithm',
-] as const;
-
-export type FeatureName = (typeof FEATURE_NAMES)[number];
 
 /** Input supplied alongside the task text. */
 export interface TaskContext {
@@ -200,26 +143,13 @@ export interface RouteDecision {
   difficulty: number;
   taskClass: TaskClass;
   expected: ExpectedCost;
-  /** True when this decision was made by the exploration policy, not by utility. */
-  exploration: boolean;
   /** Conditions that made a tier ineligible. */
   vetoes: string[];
   /** True when no verification is available, so the quality floor was raised. */
   unverified: boolean;
   features: TaskFeatures;
-  vector: number[];
-  vectorVersion: number;
-  /** Which scorer produced pLocalSuccess. */
-  scorer: 'heuristic' | 'learned' | 'hybrid';
-  /**
-   * Set when trained weights exist but could not be used (most commonly after a
-   * FEATURE_VECTOR_VERSION bump). Silently falling back to the heuristic would
-   * look like a routing-quality regression with no visible cause, so the failure
-   * is carried on the decision and printed by `proto route --explain`.
-   */
-  scorerError?: string;
   /** True when the chosen tier is a fallback forced by an unavailable tier. */
   forced: boolean;
-  /** Snapshot of tier eligibility at decision time (needed for replay). */
+  /** Snapshot of tier eligibility at decision time, for `--explain`. */
   env: RouterEnvironmentSnapshot;
 }

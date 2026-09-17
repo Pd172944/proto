@@ -191,15 +191,12 @@ function levenshtein(a: string, b: string): number {
 
 /** Commands are loaded lazily so `proto --help` stays instant. */
 async function loadCommands(): Promise<Command[]> {
-  const [{ coreCommands }, { memoryCommands }, { learningCommands }, { codeCommand }] = await Promise.all([
+  const [{ coreCommands }, { codeCommand }] = await Promise.all([
     import('./commands-core.ts'),
-    import('./commands-memory.ts'),
-    import('./commands-learning.ts'),
     import('./commands-code.ts'),
   ]);
-  // `code` is listed first because for most users it is the whole product; the rest
-  // of the CLI is the research apparatus around it.
-  return [codeCommand, ...coreCommands, ...memoryCommands, ...learningCommands];
+  // `code` is listed first because for most users it is the whole product.
+  return [codeCommand, ...coreCommands];
 }
 
 /* Re-exported for command modules. */
