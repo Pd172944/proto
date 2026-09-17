@@ -88,7 +88,7 @@ existing models:
 proto setup                       # prints the install + pull plan, runs nothing
 proto setup --download --yes      # actually runs the pull
 proto setup --runtime ollama      # explicit, same as the default
-proto models list                                             # what the runtime has, plus adapters
+proto models list                                             # what the runtime has
 proto models pull qwen2.5-coder:7b-instruct-q4_K_M            # prints the command only
 proto models pull qwen2.5-coder:7b-instruct-q4_K_M --yes      # runs it
 proto config set local.runtime ollama                         # the values below are already the defaults
@@ -96,49 +96,36 @@ proto config set local.baseUrl http://127.0.0.1:11434
 proto config set local.model qwen2.5-coder:1.5b-instruct
 ```
 
-### (b) MLX — needed to train or serve a LoRA adapter
+### (b) MLX — fast Metal inference
 
-MLX is the only supported training backend (`train.backend: "mlx-lora"`) and on Apple
-Silicon the fastest inference path. The project keeps it in a virtualenv at
-`<dataDir>/venv` — `<repo>/var/venv` by default, or `$PROTO_HOME/venv`
-(`pythonCandidate()` in `src/train/mlx.ts`).
+On Apple Silicon, MLX is the fastest local inference path and the runtime that supports
+constrained JSON output (`mlx_lm.server`). It has no install command of its own: it is a
+Python package in a virtualenv that the project keeps at `<dataDir>/venv` —
+`<repo>/var/venv` by default, or `$PROTO_HOME/venv`.
 
 ```bash
-# 1. create the project venv and install mlx-lm (you run these; proto never does)
+# 1. create the venv and install mlx-lm (you run these; proto never does)
 python3 -m venv "$PROTO_HOME/venv"          # or <repo>/var/venv when PROTO_HOME is unset
 "$PROTO_HOME/venv/bin/pip" install --upgrade pip
 "$PROTO_HOME/venv/bin/pip" install mlx-lm
+
 # 2. cache a model once (the only large download on this path)
 "$PROTO_HOME/venv/bin/python" -m mlx_lm.generate \
   --model mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit \
   --prompt "hello" --max-tokens 16
+
 # 3. serve it OpenAI-compatibly on the canonical MLX port
 "$PROTO_HOME/venv/bin/python" -m mlx_lm.server \
   --model mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit \
   --host 127.0.0.1 --port 8080
+
 # 4. point the harness at it
 proto config set local.runtime mlx
 proto config set local.baseUrl http://127.0.0.1:8080
 ```
 
-`proto setup --runtime mlx` prints the same plan. To serve a trained adapter, add
-`--adapter-path <dir>` to the `mlx_lm.server` line (adapters live under
-`<dataDir>/models/adapters/`); `proto train adapters` prints the exact command for the
-newest one.
-
-Inference and training models are deliberately separate: `local.model` is what the
-runtime serves (`qwen2.5-coder:1.5b-instruct` for Ollama), while `train.baseModel` is
-the Hugging Face repo LoRA is applied to
-(`mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit`). Conflating them produces a confusing
-"training cannot find this model" failure when inference works, which is why
-`src/config/schema.ts` documents them separately. Training is opt-in and off by default:
-
-```bash
-proto train status        # gates, budget, preflight; prints install steps if mlx-lm is missing
-proto train enable        # flips train.enabled and records local-training consent
-proto train plan          # dry run of what a tick would do
-proto train now           # force a run, gates ignored
-```
+`proto setup --runtime mlx` prints the same plan. For MLX, `local.model` is the Hugging
+Face repo id rather than an Ollama tag, because that is what `mlx_lm.server` expects.
 
 ### (c) llama.cpp — GGUF, manual
 
@@ -214,7 +201,7 @@ Canonical default endpoints (`LOCAL_RUNTIME_DEFAULTS` in `src/providers/index.ts
 | --- | --- | --- |
 | `ollama` | `http://127.0.0.1:11434` | Native `/api/chat`; keep-alive and unload support |
 | `llamacpp` | `http://127.0.0.1:8080` | OpenAI-compatible; tools disabled |
-| `mlx` | `http://127.0.0.1:8080` | `mlx_lm.server`; JSON schema supported; required for adapters |
+| `mlx` | `http://127.0.0.1:8080` | `mlx_lm.server`; JSON schema supported |
 | `openai` | `http://127.0.0.1:1234` | Any other OpenAI-compatible server, e.g. LM Studio or vLLM |
 
 `llamacpp` and `mlx` share port 8080, so run only one at a time.
@@ -300,8 +287,8 @@ A cold model must be read from disk and loaded. The router models this as
 when it is. Raise `local.keepAliveSec` so the model stays warm across a burst of tasks,
 and avoid `proto run --unload` during an interactive session (it is for reclaiming RAM
 after a batch). Ollama responses include `load_duration`, and the provider marks usage as
-measured (not estimated) once it sees a real load, so `proto episodes stats` reflects
-actual cold starts over time.
+measured (not estimated) once it sees a real load; `proto doctor` reads the runtime's
+model list to say whether the configured model is resident.
 
 ### Swap / memory pressure
 
@@ -315,14 +302,12 @@ In order of impact:
 
 ### What `proto doctor` reports, line by line
 
-`proto doctor [--probe-cloud] [--workspace <path>]` prints six sections plus next steps:
+`proto doctor [--probe-cloud] [--workspace <path>]` prints four sections plus next steps:
 
-- **environment** — Node version (must be ≥ 22.6), platform/arch, CPUs, total RAM, the resolved data dir, whether `config.json` exists yet (defaults are used when it does not), and any load-time config warnings.
-- **local tier** — `runtime @ baseUrl`, configured `model`, a ready/not-ready status from the live health probe, the first 8 models the runtime has, a hint when something is missing, and whether a trained adapter is active.
+- **environment** — Node version, platform/arch, CPUs, total RAM, the resolved data dir, whether `config.json` exists yet (defaults are used when it does not), and any load-time config warnings.
+- **local tier** — `runtime @ baseUrl`, configured `model`, a ready/not-ready status from the live health probe, the best-ranked models the runtime has (up to six), and a hint plus the exact `proto models use …` command when the configured model is missing.
 - **cloud tier** — provider id and label, resolved base URL, model (and cheap model), whether an API key was found, whether the tier is enabled, and the configured price per million tokens (`--probe-cloud` makes one tiny real request).
 - **verifier** — whether verification is on; whether `python3`, `node` and `git` are on PATH (they gate syntax checking); and whether project tests are configured.
-- **local training (opt-in)** — `train.enabled`, `train.baseModel`, and the MLX preflight; when mlx-lm is missing it prints the exact venv + pip commands.
-- **data** — episode/shard counts and bytes, local success rate, escalations, cloud spend (total and today vs the daily budget), dataset sample counts, adapter count.
 - **next steps** — a de-duplicated list of concrete fixes in the order checks found them.
 
 ## Nothing is downloaded automatically
@@ -333,12 +318,8 @@ Every large download is behind an explicit confirmation:
   requires `--yes` as well.
 - `proto models pull <name>` prints the command; only `--yes` runs it.
 - `scripts/bootstrap-local.sh` is a dry run unless `--yes` is passed.
-- `proto run`, `proto route`, `proto doctor` and `proto train tick` never download a
-  model.
-- Training never installs packages either: `preflight()` in `src/train/mlx.ts` returns
-  copy-pasteable `installInstructions` (venv → pip → `pip install mlx-lm`) and stops. Its
-  comment states the rule plainly — it "NEVER installs anything and NEVER downloads a
-  model."
+- `proto run`, `proto route`, `proto code` and `proto doctor` never download or install
+  anything.
 
 ## Quick check
 

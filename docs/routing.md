@@ -355,9 +355,9 @@ route ──► [local attempt ──► verify ──► repair] ──► esca
    bounded — an over-classified task costs one cloud call, whereas an under-classified one
    costs a silently wrong answer.
 
-5. **`localOnlyCostUsd` is always zero, by design.** Electricity is excluded from the cost
-   model (see §1), so the field is a placeholder for the honest comparison "what would
-   local cost in money" — which is nothing.
+5. **`expected.localCostUsd` is always zero, by design.** Electricity is excluded from
+   the cost model (see §1), so the field is not a measurement of anything — it is the
+   honest answer to "what would local cost in dollars", which is nothing.
 
 6. **The daily cloud budget has no ledger behind it.** `routing.cloudBudgetUsdPerDay`
    vetoes cloud only when a caller passes `cloudSpendTodayUsd`; both `proto run` and

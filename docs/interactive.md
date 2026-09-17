@@ -30,26 +30,26 @@ of corrupting a file.
 
 ---
 
-## `proto code` does not route — and that is deliberate
+## `proto code` routes — at session granularity
 
-There are two separate paths in this project, and conflating them is the easiest mistake
-to make:
+There are two paths in this project and they share the router:
 
 | Path | What it does | Uses the router? |
 |---|---|---|
-| `proto code` (and `proto-code`) | the interactive agent: one model, tool loop, approval prompts | **no** |
-| `proto run` / `proto route` | the batch two-regime path: features → quality floor → local/cloud tier → verify → escalate | **yes** |
+| `proto code` (and `proto-code`) | the interactive agent: one model, tool loop, approval prompts | **yes**, once per session |
+| `proto run` / `proto route` | the batch path: features → quality floor → local/cloud tier → verify → escalate | **yes**, once per task |
 
-The agent uses exactly the model you selected with `--provider` / `--model` / `--local`,
-for the whole session. It does not consult task difficulty, does not pick a tier per
-turn, and does not escalate to a bigger model when it fails. Routing belongs to the
-batch path, where a task is a single self-contained unit that can be classified before
-any tokens are spent.
+The agent routes on your **first message**, because that message is a task description
+and can be classified before any tokens are spent. It then keeps that model for the
+session. Later turns are reactions to tool output whose shape is unknown in advance, and
+switching models mid-conversation would break prompt caching and the provider's view of
+the thread — which costs more than the routing saves. Re-decide on demand with `/route`,
+or move one tier at a time with `/escalate` / `/deescalate`. `--per-turn-route` opts into
+per-message routing for experimentation, and `--escalate-on-stuck` moves to a stronger
+tier automatically if the agent burns its step budget.
 
-Why: a routing decision needs a *task* to reason about, and an agent turn is not one —
-it is a conversation whose shape is unknown in advance. Switching models mid-turn would
-also break prompt caching and invalidate the provider's view of the conversation, which
-costs more than the routing saves.
+Any explicit model choice (`--local`, `--model`, `--provider`) turns routing off, and so
+does `--no-route`; `--route` forces it back on.
 
 How to tell which model answered: the status line after each turn. Cloud shows a real
 cost, local shows `$0.0000`:
@@ -59,8 +59,7 @@ steps 3 · tokens 955↓ 531↑ · cost $0.0096 · time 23.6s · edited solution
 ```
 
 `955↓ 531↑` tokens for `$0.0096` is a cloud model. The same turn on a local model would
-read `cost $0.0000`. `/model` inside a session switches models; `/cost` totals the
-session.
+read `cost $0.0000`. `/model` switches models explicitly; `/cost` totals the session.
 
 ## The loop
 
@@ -127,9 +126,11 @@ Two deliberate properties:
 | Command | What it does |
 |---|---|
 | `/help` | list everything |
+| `/route [task]` | re-run the router and switch tier (defaults to re-routing the last message) |
+| `/escalate` / `/deescalate` | move up or down one tier |
 | `/model [name]` | show or switch model |
-| `/local` / `/cloud` | switch tier for this session |
-| `/workspace` | root, git branch, detected instruction files |
+| `/local` / `/cloud` | switch to the local or cloud model for this session |
+| `/workspace` | root, git branch, file count, detected instruction files |
 | `/tools` | tools grouped by risk |
 | `/cost` | tokens, spend, files edited |
 | `/clear` | forget the conversation |
@@ -174,7 +175,7 @@ There are **two** launchers and `proto` is the one that gives you every command:
 
 | Command | What it is |
 |---|---|
-| `proto` | the whole CLI — `doctor`, `code`, `route`, `eval`, `train`, … |
+| `proto` | the whole CLI — `code`, `doctor`, `setup`, `route`, `run`, `models`, `config`, `index` |
 | `proto-code` | a shortcut that runs `proto code` directly |
 
 Link both (the installer does exactly this):
@@ -361,7 +362,7 @@ files, ~6,000 lines) and mixing a vendored dataset into it would be a mess. The
 | `reset <n>` | Restore the stub |
 
 `run` gives every problem its own `PROTO_HOME`, so an evaluation never touches your
-real `var/` episodes or sessions.
+real `var/` sessions.
 
 ### Read this before believing the number
 
@@ -463,9 +464,9 @@ in effect.
 
 ## Known limitations
 
-- **No repo-wide retrieval.** It searches and reads, but there is no embedding index
-  or symbol graph. On a very large repository it will be slower to find things than
-  an agent with an LSP-backed index.
+- **No embeddings.** It has a symbol graph and a repo map (see
+  [codebase-index.md](codebase-index.md)), but no embedding index. On a very large
+  repository it will be slower to find things than an agent with an LSP-backed index.
 - **No sub-agents or parallel tool calls.** One conversation, one step at a time.
   This is deliberate (context fragmentation is the failure mode of multi-agent
   designs) but it means a long task takes longer than a parallel implementation.

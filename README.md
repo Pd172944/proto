@@ -9,19 +9,16 @@ cd ~/my-project && proto-code        # an agent that reads, edits and runs comma
 
 Then, if you want the local/cloud economics: easy work goes to a fast model on your
 machine, hard work goes to a cloud model behind your key, and verification decides
-which was good enough.
+whether the answer was good enough.
 
 Easy coding work — fix an off-by-one, rewrite a loop, rename a symbol, change a
 prompt, add a guard clause, write a docstring — goes to a **very fast local model**
 running on your laptop. Hard work — architecture, migrations, concurrency,
 security, performance — goes to a **cloud model** behind whatever API key you
-already pay for. Every result is **verified locally before you see it**, failures
-**escalate** automatically, and the whole thing is recorded so your local model
-and the router can get better over time — cheaply, in the background, and only
-if you say so.
+already pay for. Every result is **verified locally before you see it**, and failures
+**escalate** automatically.
 
-Nothing downloads a model without you asking. Nothing leaves your machine
-without a separate, explicit opt-in. There are **zero runtime npm
+Nothing downloads a model without you asking. There are **zero runtime npm
 dependencies**; it runs on Node 22's built-in tooling.
 
 ```
@@ -43,13 +40,7 @@ dependencies**; it runs on Node 22's built-in tooling.
       │ syntax, patch │
       │ anchors, size │   passed
       │ patterns,tests│ ──────────────► accept (write only with --apply)
-      └───────┬───────┘
-              ▼
-      ┌─────────────────────────────────────────────────────────────┐
-      │  episode log (redacted at rest) → datasets → fast loop:     │
-      │  retrain the router (ms) │ slow loop: LoRA on the local     │
-      │  model (minutes, idle + wall power only, opt-in)            │
-      └─────────────────────────────────────────────────────────────┘
+      └───────────────┘
 ```
 
 ---
@@ -69,10 +60,26 @@ Routing is a pure function of the task text and your environment, so you can
 inspect decisions before configuring anything:
 
 ```bash
-./bin/proto route "Fix the off-by-one error in this loop so it does not go out of bounds" --explain
-./bin/proto eval run          # score the router on the built-in 22-task corpus
-./bin/proto eval compare      # heuristic vs learned vs hybrid
-./bin/proto simulate --tasks 2500     # model the learning curve (no model needed)
+# with a cloud key configured, a hard-locked class always takes the strongest model:
+./bin/proto route "Design the module boundaries for billing"
+```
+
+```text
+routing decision
+  tier          cloud-strong
+  reason        hard task (difficulty 0.48, class "architecture", no files in scope) -> strongest cloud model
+  p(local ok)   0.299   difficulty 0.477   class architecture
+  est. cost     local $0.0000 vs cloud $0.0084
+  est. latency  local 7.5s vs cloud 10.2s
+
+why
+  - heuristic scorer: p(local)=0.299
+  - difficulty 0.477 for class "architecture"
+  - local not eligible: local runtime unavailable: Ollama is not responding at http://127.0.0.1:11434; "architecture" is hard-locked to the cloud: a wrong answer here is expensive and the verifier cannot catch it
+
+vetoes
+  - local runtime unavailable: Ollama is not responding at http://127.0.0.1:11434
+  - "architecture" is hard-locked to the cloud: a wrong answer here is expensive and the verifier cannot catch it
 ```
 
 Run the whole loop end to end against deterministic mock models — no network, no
@@ -80,7 +87,7 @@ local runtime, no downloads:
 
 ```bash
 ./bin/proto run "Fix the off-by-one error in this loop so it does not go out of bounds" \
-  --file path/to/prices.py --mock
+  --file src/router/policy.ts --mock
 ```
 
 ### 1. Install a local model (you choose when)
@@ -89,7 +96,7 @@ local runtime, no downloads:
 
 ```bash
 ./bin/proto setup                      # Ollama path, with a recommendation table
-./bin/proto setup --runtime mlx        # MLX path (also the trainer)
+./bin/proto setup --runtime mlx        # MLX inference path
 ./scripts/bootstrap-local.sh           # same thing as a script; dry-run by default
 ./scripts/bootstrap-local.sh --yes     # actually run the download
 ```
@@ -103,12 +110,14 @@ ollama pull qwen2.5-coder:1.5b-instruct
 ./bin/proto doctor           # confirms the harness can see it
 ```
 
+Runtime choices, memory limits and troubleshooting are in
+**[docs/local-models.md](docs/local-models.md)**.
+
 ### 2. Add a cloud key
 
 The key is read from the environment (preferred) or a `0600` file. It is never
-written into config, never logged, and never stored in an episode. **A present key
-is enough** — the cloud tier enables itself, so `export OPENROUTER_API_KEY=...`
-is the entire setup.
+written into config and never logged. **A present key is enough** — the cloud tier
+enables itself, so `export OPENROUTER_API_KEY=...` is the entire setup.
 
 ```bash
 export OPENROUTER_API_KEY=...       # or ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, ...
@@ -122,7 +131,6 @@ export OPENROUTER_API_KEY=...       # or ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEP
   --file src/prices.py                 # dry run: shows the change, writes nothing
 ./bin/proto run "..." --file src/prices.py --apply     # write it
 ./bin/proto route "Design the module boundaries for billing" --explain   # → cloud
-./bin/proto episodes stats             # what has it learned about your local model?
 ```
 
 ---
@@ -131,28 +139,36 @@ export OPENROUTER_API_KEY=...       # or ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEP
 
 An interactive agent you run from inside a project, like `claude` or any other
 terminal coding agent. It gathers context (git state, project layout, `AGENTS.md` /
-`CLAUDE.md`), then loops: model → tool calls → results → model, until the task is
-done or it is genuinely blocked.
+`CLAUDE.md`, the codebase index), then loops: model → tool calls → results → model,
+until the task is done or it is genuinely blocked.
+
+The agent also **uses the router**, at session granularity: the first message is a task
+description, so it is classified exactly like a batch task, and the session runs on the
+chosen tier. Later turns stay on that model — switching mid-conversation would break
+prompt caching — until you `/route` again or `/escalate`. Any explicit model choice
+(`--local`, `--model`, `--provider`) turns routing off.
 
 | | |
 |---|---|
 | **Tools** | `read_file`, `list_files`, `search` (read) · `write_file`, `edit_file` (write) · `run_command` (exec) |
 | **Consent** | every write shows a real diff and every command shows the exact command line, before it runs. "Always" lasts only for the session |
 | **Edits are verified** | `edit_file` refuses a missing *or ambiguous* anchor, a change that would not parse, and introduced anti-patterns — reusing the same verifier the batch harness uses |
-| **Bounded** | step cap and wall-clock budget per turn, so it cannot loop forever on your money |
+| **Routed** | the router picks the tier from your first message; `/route`, `/escalate` and `--escalate-on-stuck` move it |
+| **Bounded** | step cap and wall-clock budget per turn, plus `--budget-usd`, so it cannot loop forever on your money |
 | **Interruptible** | Ctrl-C aborts the turn, not the session |
 | **Fails closed** | a piped run denies writes unless you pass `--yes` deliberately |
 
 ```bash
 proto code                              # interactive, in the current directory
 proto code --read-only                  # physically cannot write anything
-proto code --local                      # use the local model instead of the cloud
+proto code --no-route                   # one configured model, no routing
+proto code --local                      # pin the local model for this session
 proto code --demo                       # zero-setup: scripted provider, real loop
 proto code "explain the auth flow" --print    # one-shot, composes with pipes
 ```
 
-Slash commands: `/help /model /local /cloud /workspace /tools /cost /clear /save /quit`.
-`!command` runs a shell command directly.
+Slash commands: `/help /route /escalate /deescalate /model /local /cloud /workspace
+/tools /cost /clear /sessions /save /quit`. `!command` runs a shell command directly.
 
 Colour scheme is ember-and-deep-water (amber structure, teal for actionable things,
 coral only for failure), inspired by [gum](https://github.com/charmbracelet/gum)'s
@@ -172,8 +188,8 @@ Two facts about local models on a laptop, both true at once:
 The interesting engineering is not "call a local model". It is **knowing which of
 those two situations you are in**, and knowing it cheaply enough that the routing
 decision costs less than the work it saves. That is what this repo is about, and
-it is why the most carefully reasoned code here is the router, the verifier, and
-the reward function — not the API clients.
+it is why the most carefully reasoned code here is the router and the verifier —
+not the API clients.
 
 ---
 
@@ -186,10 +202,10 @@ the reward function — not the API clients.
 | `cloud-cheap` | a cheaper model on the same provider | moderate tasks local could not take | 2–6 s |
 | `cloud-strong` | your chosen cloud model | hard, risky or unverifiable work | 5–30 s |
 
-Routing is **model-free**: features are extracted with regexes and cheap
-structural analysis of the task and any files in scope, so a decision costs
-~0 ms and $0. A small logistic regression, trained in milliseconds from your own
-logged episodes, refines the heuristic prior. See **[docs/routing.md](docs/routing.md)**.
+Routing is **model-free and purely heuristic**: features are extracted with regexes
+and cheap structural analysis of the task and any files in scope, so a decision
+costs ~0 ms and $0. There is no trained scorer and no learning loop — the rules are
+the whole policy. See **[docs/routing.md](docs/routing.md)**.
 
 The decision rule is an expected-cost comparison with a **quality floor**, and the
 distinction matters. Pure cost minimisation is degenerate: local inference is
@@ -235,114 +251,16 @@ not pass.
 
 ---
 
-## Learning: two speeds, honestly labelled
+## Privacy
 
-The project claims "RL at basically zero compute". Interrogating that claim
-honestly means separating it in two:
+There is no telemetry, no contribution channel, and no episode log. The only ongoing
+writer is `proto code`, which saves a **session transcript** to the data directory
+(the full conversation, including file contents the agent read and command output). It
+is not redacted; `--no-save` turns it off. `proto run`, `proto route` and `proto doctor`
+write nothing.
 
-**The fast loop** — retraining the router's logistic regression from your episode
-log. Milliseconds, bounded by the size of the log, so it runs on every tick with
-no gating at all. This is where most of the practical benefit lives: the harness
-learns which tasks *your* local model, at *your* quantisation, can actually
-handle.
-
-**The slow loop** — LoRA fine-tuning the local model itself. This is the part that
-costs real compute, so it is deferred, gated, and can be skipped for weeks without
-anything breaking:
-
-```
-gates: opt-in · 01:00–06:00 · wall power · not thermally throttled ·
-       1-min load ≤ 4 · ≥ 25 new labelled episodes · ≤ 60 min/day ·
-       mlx-lm present (never installed automatically)
-```
-
-Every gate reports a reason whether it passes or fails, so `proto train status`
-can always answer *"why isn't this running?"* — the most common failure mode of
-background ML systems is silently doing nothing.
-
-When it does run, it runs under macOS background QoS (`taskpolicy -b nice -n 19`),
-with a wall-clock cap, a **load watchdog that aborts the moment you get busy**, and
-a checkpoint every 20 steps. The LoRA config is deliberately tiny (rank 8, 8
-layers, ~60 iterations): a nudge that teaches your preferences, not a retrain.
-
-Learning signals come from verification, not from vibes:
-
-- **SFT** — local attempts that *passed verification* (rejection sampling on work
-  you already did).
-- **Distillation** — tasks local failed and the cloud then solved.
-- **DPO preference pairs** — the same task, local's failed answer as `rejected`,
-  the cloud's verified answer as `chosen`.
-
-Reward is an explicit, versioned, documented linear function — not a learned
-reward model, because a reward model trained on a few hundred laptop-scale samples
-has invisible failure modes and needs the compute we are trying to avoid. See
-**[docs/rl-design.md](docs/rl-design.md)**.
-
-Opt in when you want it:
-
-```bash
-./bin/proto train enable         # private local fine-tuning
-./bin/proto datasets build --write
-./bin/proto train plan           # dry run: shows the exact command it would run
-./bin/proto train now            # force one session (still watchdogged)
-./bin/proto train install-agent  # generate a launchd plist; prints install steps
-./bin/proto train adapters       # list adapters + how to serve them
-```
-
----
-
-### How much does this actually learn?
-
-`proto simulate` answers that with a curve rather than a promise. It runs the
-**real** router and the **real** logistic-regression trainer over a synthetic user,
-with a simulated local model that has per-class quirks the heuristic cannot see.
-
-Measured over 2,500 simulated tasks with the shipped defaults:
-
-| | after ~100 tasks | after ~2,500 tasks |
-|---|---|---|
-| labelled local attempts | 68 | 1,647 |
-| deployed (hybrid) router AUC | 0.724 | 0.747 |
-| heuristic prior AUC | 0.676 | 0.676 |
-| SFT rows available for the local model | 99 | 2,000 |
-| DPO preference pairs | 12 | 364 |
-
-Read it this way: the **router** starts adapting after roughly 100 tasks and buys a
-real but modest gain — it learns *your* task mix and your model's quirks. For the
-**local model itself**, SFT data accumulates steadily but preference data accrues
-about 7× more slowly, because a DPO pair needs a task local got wrong *and* the
-cloud then fixed. Softer levers that matter more than anything else: raise
-`train.maxRuntimeMin` (overnight, e.g. 480) so a session can cover multiple epochs,
-and choose a *larger local model* — going 1.5B → 7B will do more for capability
-than any amount of LoRA on a laptop's worth of data.
-
-A wrong-but-accepted answer rate of ~3.5% is the honest cost of routing to a cheap
-model, which is why `verify.runTests` matters. Full analysis, including the three
-slow-loop bugs the curve exposed, is in [docs/rl-design.md](docs/rl-design.md).
-
-## Privacy and consent
-
-Three **independent** decisions, all off by default:
-
-| Decision | Flag | What it means |
-|---|---|---|
-| Private local fine-tuning | `train.enabled` / `proto train enable` | your episodes improve *your* model; nothing leaves the machine |
-| Global sharing | `contrib.enabled` / `proto contrib consent --global on` | derived data may be contributed to a shared pool |
-| Raw text sharing | `contrib.shareCode` / `--share-code on` | redacted task/output text may be included in contributions |
-
-Redaction happens **before anything is written to disk**, not at upload time —
-so the worst case is a less useful training record, not a leaked key sitting in a
-JSONL file. `proto episodes redact-check --text "..."` lets you test it yourself.
-
-By default a contribution contains router features, verification labels,
-preference facts, content hashes, and a **rotating pseudonym** — never task text,
-file contents or model outputs. Uploads are never automatic: consent **and** a
-configured endpoint **and** a per-call `--yes`, and bundles are staged to an
-outbox first. `proto contrib preview --live` shows the worst case.
-
-This is linkability reduction and at-rest hygiene, **not** differential privacy.
-See **[docs/privacy.md](docs/privacy.md)** for the full threat model, including
-what this design does not protect against.
+See **[docs/privacy.md](docs/privacy.md)** for exactly what is on disk and what leaves
+your machine.
 
 ---
 
@@ -350,21 +268,14 @@ what this design does not protect against.
 
 | Command | Purpose |
 |---|---|
-| `proto code [prompt] [--local] [--read-only] [--demo] [--print]` | **interactive coding agent** rooted at the current directory |
-| `proto doctor [--probe-cloud]` | check runtimes, providers, verifier, trainer; say exactly what is missing |
+| `proto code [prompt] [--local] [--read-only] [--demo] [--print] [--no-route]` | **interactive coding agent** rooted at the current directory |
+| `proto doctor [--probe-cloud]` | check runtimes, providers and the verifier; say exactly what is missing |
 | `proto setup [--runtime …] [--download --yes]` | print (or run) local model install instructions |
 | `proto route "<task>" [--file p]… [--explain]` | show the routing decision; no model calls |
-| `proto run "<task>" [--file p]… [--apply] [--tier t] [--mock] [--dry-run]` | full loop: route → attempt → verify → escalate → record |
-| `proto models list \| pull <name> [--yes]` | local models, adapters, and download commands |
+| `proto run "<task>" [--file p]… [--apply] [--tier t] [--mock] [--dry-run]` | full loop: route → attempt → verify → escalate |
+| `proto models list \| use <name> \| pull <name> [--yes]` | what the local runtime has, and download commands |
 | `proto config path\|show\|get\|set\|set-key\|providers` | inspect and edit configuration |
-| `proto episodes ls\|show <id>\|stats\|prune\|redact-check` | inspect exactly what has been recorded |
-| `proto feedback <id> accept\|reject\|edit` | the strongest learning signal available |
-| `proto datasets build [--write] [--sample n]` | inspect or write SFT / DPO / router datasets |
-| `proto train status\|tick\|now\|plan\|enable\|disable\|router\|adapters\|install-agent` | the deferred RL machinery |
-| `proto eval run\|compare\|list` | score routing offline against the corpus |
-| `proto replay [--mode …] [--floor n]` | re-score history under a different policy; no model calls |
-| `proto simulate [--tasks n] [--sweep] [--adaptive]` | model the learning curve: how many tasks until it measurably improves |
-| `proto contrib status\|preview\|stage\|upload\|consent\|outbox\|rotate` | the opt-in sharing channel |
+| `proto index [--stats] [--map "focus"] [--symbol N] [--refs N] [--outline p]` | build and inspect the codebase index |
 
 Every command supports `--json`. Add `--help` to any of them.
 
@@ -388,15 +299,14 @@ The knobs that matter most:
 | `cloud.cheapModel` | — | the `cloud-cheap` tier's model |
 | `routing.qualityFloor` | `0.72` | how much local work you tolerate |
 | `routing.qualityFloorUnverified` | `0.90` | paranoia level for unverifiable edits |
-| `routing.exploration.epsilon` | `0.06` | how often to gather counterfactual data |
-| `routing.cloudBudgetUsdPerDay` | `5` | hard stop on surprise bills |
+| `routing.qualityFloorReadOnly` | `0.55` | floor for read-only explanations |
+| `routing.maxCloudAttempts` | `2` | hard cap on cloud calls per task |
+| `routing.cloudBudgetUsdPerDay` | `5` | daily budget hook (see docs/routing.md §9.6) |
 | `verify.runTests` / `verify.testCommand` | off / — | real behavioural verification |
-| `memory.storeTaskText` / `storePrompts` | `true` | the privacy/completeness trade-off |
-| `train.*` | off | the opt-in slow loop |
 
 Useful environment variables: `PROTO_HOME`, `PROTO_LOCAL_MODEL`,
 `PROTO_CLOUD_PROVIDER`, `PROTO_CLOUD_MODEL`, `PROTO_DISABLE_LOCAL`,
-`PROTO_DISABLE_CLOUD`, `PROTO_DISABLE_MEMORY`, `PROTO_ROUTING_MODE`, `PROTO_LOG`.
+`PROTO_DISABLE_CLOUD`, `PROTO_QUALITY_FLOOR`, `PROTO_CLOUD_BUDGET_USD`, `PROTO_LOG`.
 
 ---
 
@@ -404,24 +314,21 @@ Useful environment variables: `PROTO_HOME`, `PROTO_LOCAL_MODEL`,
 
 ```
 src/
-  agent/          the agent loop, session state, and prompt construction
+  agent/          the interactive agent loop, session state, compaction
   tools/          the tool contract and the file/shell tools      ← edit_file is verifier-backed
   tui/            terminal rendering: palette, boxes, diffs, markdown
-  cli/            command dispatch + the command groups
+  cli/            command dispatch + the core and code commands
   config/         schema, defaults, provider profiles, pricing, secret resolution
   providers/      the provider contract; OpenAI-compatible, Anthropic, Ollama, mock
-  router/         features → heuristic → learned scorer → policy   ← the core
+  router/         features → heuristic score → policy            ← the core
   verify/         candidate parsing, in-memory patching, syntax, patterns, tests
-  harness/        prompt construction and the agent loop
-  memory/         episode schema, redaction, reward, store, datasets
-  train/          scheduler gates, MLX driver, job queue, adapters
-  contrib/        consent records, bundle construction, outbox, upload
-  eval/           task corpus, routing metrics, counterfactual replay
+  harness/        prompt construction and the batch run loop
+  index/          the codebase index: symbols, references, ranked repo map
   util/           logging, argv, text, hashing, atomic fs, process helpers
-test/             345 tests, no network, no hardware required
-docs/             interactive.md · codebase-index.md · routing.md · rl-design.md · local-models.md · privacy.md
+test/             383 tests, no network, no hardware required
+docs/             interactive.md · codebase-index.md · routing.md · local-models.md · privacy.md
 bench/            the agentic benchmark suite (see bench/README.md)
-scripts/          bootstrap-local.sh (dry-run default) · nightly-tick.sh
+scripts/          install.sh · bootstrap-local.sh · humaneval.py
 ```
 
 ---
@@ -443,25 +350,22 @@ detectable without guessing.
 match exactly once or the edit is rejected. Ambiguous anchors are rejected rather
 than guessed.
 
-**Verification before trust, always.** `passed` is the only definition of success,
-and it is the training label. This is what makes escalation trustworthy and what
-keeps the RL data honest.
+**Verification before trust, always.** `passed` is the only definition of success.
+This is what makes escalation trustworthy.
 
-**The label is the verification verdict, not the escalation event.** Exploration
-episodes therefore produce genuine counterfactual labels — the thing the router
-most needs and the thing a purely greedy router never collects.
+**The router is a pure function.** `decideRoute` depends only on features, environment
+and config, so a decision is explainable (`proto route --explain`) and reproducible
+without calling a model. That purity is what lets routing cost ~0 ms.
 
 **Transport failures are not model failures.** If your local server is down, the
-attempt is recorded with an error and no verification, so it produces no training
-label. Conflating an outage with "the model is bad" would poison the router.
+attempt is recorded as a transport error and no verification runs. Conflating an
+outage with "the model is bad" would make the harness blame the wrong thing.
 
 **`offline` routing means "no I/O", not "local is broken".** Getting this wrong
 silently mis-routes everything; there is a test pinning it down.
 
-**Redaction at rest, not at upload.** See above.
-
-**A zero-compute fast loop and a gated slow loop, kept separate.** It is what lets
-the "zero compute" claim survive scrutiny.
+**Cloud availability is inferred, never probed.** A health check costs money on some
+providers and adds latency to every decision; real failures surface at the attempt.
 
 ---
 
@@ -471,46 +375,35 @@ Stated plainly, because a research project that hides these is not one:
 
 - The heuristic coefficients encode opinions about small-model competence, not
   measurements. They are transparent and unit-tested, not calibrated.
-- The eval corpus is 22 hand-written tasks. It is a regression guard, not a
-  benchmark. Labelling is by expected competence, and a length-only heuristic
-  cannot score well on it — that property is itself tested.
-- The learned scorer is evaluated in-sample by default. A time-split holdout is
-  available (`logisticEvalFromEpisodes(..., {holdout: true})`); with a handful of
-  episodes neither number means much.
-- The inverse-propensity weighting is an approximation of a stochastic behavior
-  policy, not a rigorous off-policy estimator. Documented as such.
-- Replay can re-score decisions but cannot know whether local *would* have
-  succeeded where it was never attempted. Route changes on unobserved episodes are
-  hypotheses.
+- There is no offline corpus and no score command any more, so routing quality is
+  **unvalidated**. Unit tests pin the asymmetries (hard classes never route local,
+  every veto fires), but "does this route well?" is open.
 - Latency and decode-speed estimates are order-of-magnitude figures derived from
   parameter count and quantisation.
-- Contributed data has no adversarial or decontamination filtering yet.
+- The daily cloud budget has no ledger behind it; the real bound on a single task is
+  `routing.maxCloudAttempts`.
+- The router never adapts: it applies the same rules on the first task and the
+  thousandth.
+- Hardest-match-wins deliberately over-reports difficulty. An over-classified task
+  costs one cloud call; an under-classified one costs a silently wrong answer.
 - The verifier cannot catch a semantically wrong but syntactically valid change
   unless you enable your project's tests. **That is the single biggest gap**, and
   the reason `qualityFloorUnverified` is high.
-
-Roadmap: GRPO / group-relative methods using per-token logprobs
-(`local.requestLogprobs` already exists), a learned reward model once preference
-data is plentiful, true off-policy evaluation, adapter A/B evaluation against a
-held-out slice, and decontamination checks on contributed data.
 
 ---
 
 ## Development
 
 ```bash
-npm test            # 345 tests, no network or hardware required
+npm test            # 383 tests, no network or hardware required
 npm run typecheck   # requires typescript installed (devDependency, optional)
 npm run doctor
 PROTO_LOG=debug ./bin/proto run "..." --mock
 ```
 
 The test suite covers the components whose silent degradation would be most
-damaging: the redactor (including that it does *not* mangle ordinary code), the
-router policy (including every veto and hard lock), the verifier, the reward
-function, the scheduler gates (every one must refuse when it should), and the
-end-to-end loop (including that a dry run never writes and never pollutes the
-episode log).
+damaging: the router policy (including every veto and hard lock), the verifier, the
+codebase index, the agent loop, session persistence, and the transport layer.
 
 ## Status
 
