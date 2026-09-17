@@ -160,24 +160,54 @@ def load_suite(suite: str) -> list[Task]:
 # ------------------------------------------------------------------------ running
 
 
-def build_venv(run_root: Path, quiet: bool = False) -> Path:
+def build_venv(run_root: Path, quiet: bool = False) -> tuple[Path, str]:
     """
     A virtualenv the agent and the verifier share, so `python` resolves to the same
     interpreter for both. The agent inventing `python3 -m pytest` and hitting an
     unrelated plugin crash is a harness failure, not a model failure.
+
+    Returns the venv and a warning string. The warning matters: `sys.executable` is
+    whatever interpreter launched this script, and on a machine with several Pythons
+    that is not necessarily the one with pytest. Discovering that *after* a run means
+    reading "0/10 solved" as a model result when it is a broken verifier — the exact
+    way a benchmark lies. So the dependency is checked here, installed if it can be,
+    and reported if it cannot.
     """
     venv = run_root / "venv"
-    if (venv / "bin" / "python").exists():
-        return venv
+    py = venv / "bin" / "python"
+    if not py.exists():
+        if not quiet:
+            print(f"  building shared virtualenv at {venv}")
+        subprocess.run(
+            [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    probe = subprocess.run([str(py), "-c", "import pytest"], capture_output=True, text=True)
+    if probe.returncode == 0:
+        return venv, ""
+
+    # Inherited site-packages did not provide pytest. Install it into the venv rather
+    # than failing: every task's verifier uses pytest, so without it the suite is not
+    # runnable at all.
     if not quiet:
-        print(f"  building shared virtualenv at {venv}")
-    subprocess.run(
-        [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
-        check=True,
+        print(f"  installing pytest into {venv} (the launching interpreter lacks it)")
+    install = subprocess.run(
+        [str(py), "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "pytest"],
         capture_output=True,
         text=True,
     )
-    return venv
+    if install.returncode == 0 and subprocess.run([str(py), "-c", "import pytest"], capture_output=True).returncode == 0:
+        return venv, ""
+
+    return venv, (
+        f"the verifier environment has no pytest and it could not be installed "
+        f"(launching interpreter: {sys.executable}). Every task would be reported as "
+        f"failed regardless of the model. Fix with: "
+        f"{py} -m pip install pytest"
+    )
 
 
 def base_env(venv: Path | None) -> dict:
@@ -396,7 +426,10 @@ def cmd_validate(tasks: list[Task], run_root: Path) -> int:
     solution that does not actually solve it.
     """
     print("validating suite — every task must FAIL on its initial state\n")
-    venv = build_venv(run_root)
+    venv, warning = build_venv(run_root)
+    if warning:
+        print(f"  ERROR: {warning}\n")
+        return 2
     env = base_env(venv)
     run_dir = run_root / "validate"
     bad = 0
@@ -435,7 +468,11 @@ def cmd_run(tasks: list[Task], args: argparse.Namespace) -> int:
     run_dir = run_root / label
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    venv = build_venv(run_dir)
+    venv, venv_warning = build_venv(run_dir, quiet=args.no_venv)
+    if venv_warning and not args.no_venv:
+        # Refuse to run rather than produce a table of zeros that looks like a result.
+        print(f"ERROR: {venv_warning}")
+        return 2
     env = base_env(venv) if not args.no_venv else base_env(None)
     if args.model:
         env["PROTO_LOCAL_MODEL"] = args.model
