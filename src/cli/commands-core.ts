@@ -506,7 +506,7 @@ const run: Command = {
     { name: 'mock', type: 'boolean', description: 'use deterministic mock providers (no network, no local runtime)' },
     { name: 'show-output', type: 'boolean', description: 'print the raw model output' },
     { name: 'split', type: 'boolean', description: 'the cloud model plans, the local model writes the edits' },
-    { name: 'split-concurrency', type: 'number', description: 'executor calls in flight at once (default 4)' },
+    { name: 'split-concurrency', type: 'number', description: 'executor calls in flight at once (default 1; only helps a batching server)' },
   ],
   async run(ctx): Promise<CommandResult> {
     const built = buildTaskContext(ctx);

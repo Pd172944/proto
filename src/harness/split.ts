@@ -80,7 +80,22 @@ export interface SplitOptions {
   planner: Provider;
   /** The fast model: produces the edits. */
   executor: Provider;
-  /** How many executor calls may be in flight at once. */
+  /**
+   * How many executor calls may be in flight at once. Defaults to 1.
+   *
+   * **Serial is the right default, which is counter-intuitive and was measured.**
+   * Local decode is memory-bandwidth bound, so concurrent requests do not add
+   * throughput — they split the same bandwidth and make every request slower. On a
+   * 9B over three files:
+   *
+   *     concurrency 1   4.9s / 9.2s / 14.1s   -> 14.1s wall
+   *     concurrency 4  21.6s / 26.0s / 30.7s  -> 30.7s wall
+   *
+   * Over twice as slow, with the same work. Raise this only for an executor that
+   * genuinely batches on its side and has bandwidth to spare — vLLM with continuous
+   * batching is the real case, where several requests are scheduled into one forward
+   * pass and concurrency is close to free.
+   */
   concurrency?: number;
   /** Repair rounds after a failed verification. */
   maxRepair?: number;
@@ -444,9 +459,7 @@ export async function runSplitOnce(
     };
   }
 
-  // Concurrency is the whole point: the executor is slow per token, so several
-  // independent edits in flight is what makes the local model viable here at all.
-  const concurrency = Math.max(1, opts.concurrency ?? 4);
+  const concurrency = Math.max(1, opts.concurrency ?? 1);
   const executorStarted = Date.now();
 
   const steps = await mapLimit(planned.plan.steps, concurrency, async (step): Promise<ExecutedStep> => {

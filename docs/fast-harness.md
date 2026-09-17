@@ -74,13 +74,26 @@ proto run "..." --split --apply          # write it, once verification passes
 
 Why it can be faster: the executor's prompt is tiny. A full agent turn re-sends the
 whole transcript every step — 13,000 tokens on the run above — while an executor step
-sends one file and one sentence, measured at 343–456 tokens. And the steps are
-independent, so they run concurrently (`--split-concurrency`, default 4).
+sends one file and one sentence, measured at 343–456 tokens, and it never accumulates.
 
-That concurrency is not a nicety. A 9B local model at ~21 tok/s is *slow per token*, and
-without several steps in flight it loses to a fast remote model outright. The split is
-what makes the local model's economics (free, private, unmetered) usable in a latency
-budget.
+## Concurrency does not help a local executor, and the first version of this document said it did
+
+The original design ran the independent steps concurrently on the theory that a slow
+local model needs several requests in flight to compete. That is wrong, and measuring it
+took one run. Three files, one edit each, 9B on Ollama:
+
+| `OLLAMA_NUM_PARALLEL` | per-step | wall |
+| --- | --- | --- |
+| 1 (default) | 4.9s, 9.2s, 14.1s | **14.1s** |
+| 4 | 21.6s, 26.0s, 30.7s | **30.7s** |
+
+Twice as slow for the same work. Local decode is bound by memory bandwidth, not by
+scheduling, so concurrent requests split the same bandwidth and every request pays. The
+default is now 1.
+
+Concurrency *does* help an executor that genuinely batches — vLLM schedules several
+requests into one forward pass, so `--split-concurrency 4` against a vLLM endpoint is
+close to free. Raise it there, not here.
 
 ### What the split does not do
 
@@ -139,9 +152,22 @@ Measured on a two-bug Python fixture, endpoint and executor on the same vLLM box
 | plain agent turn (`proto code`) | 6.9–7.4s, $0.00, ~0.5s local CPU |
 | split (`proto run --split`) | 6.69s (2.12s planner, 4.57s executor incl. one retry) |
 
-**Not measured:** the split with a genuinely local executor. Every number above used
-the endpoint for both roles, because starting Ollama would have loaded a 9B model onto
-the machine, and that was explicitly out of scope at the time. The design claim — that
-a small local model in the executor role beats one in the agent loop because its prompts
-are ~30x smaller and its steps are concurrent — is a reasoned prediction from the
-prompt sizes, not a result. Run it with Ollama up before trusting it.
+And against a **genuine local executor** — `ornith-1.5:9b` on Ollama, cloud planner:
+
+| | |
+| --- | --- |
+| planner (endpoint) | 2.2s |
+| executor (local 9B), first call, cold | 28.0s |
+| executor (local 9B), warm | ~9.8s |
+| **total, warm** | **12.0s** |
+
+It works. Both bugs fixed, verified by running the code, and a three-file task was fixed
+across all three files. Warm, the whole split is about **1.8x slower** than using the
+remote endpoint for both roles — not the 20x the cold number suggests, because the
+planner is a fixed cost and the model stays resident after the first call.
+
+The honest read: for **pure speed on a task this small**, the endpoint wins. The local
+executor is worth choosing for the other reasons — it is unmetered, it works when the
+network does not, and no code leaves the machine. If you want it competitive on latency
+too, the lever is a smaller executor model, not a faster machine: a 1.5-3B decodes at
+100+ tok/s where a 9B manages ~21.
