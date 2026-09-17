@@ -164,11 +164,25 @@ const doctor: Command = {
     // ---- cloud tier ----
     human.push(style.bold('cloud tier'));
     const keyPresent = Boolean(resolveApiKeyFor(ctx.cfg, ctx.dataDir));
+    const keyRequired = ctx.cfg.cloud.requiresKey !== false;
     const profile = providerProfile(ctx.cfg.cloud.provider);
     human.push(`  provider      ${ctx.cfg.cloud.provider}${profile ? ` (${profile.label})` : ' (unknown provider id)'}`);
     human.push(`  base url      ${cloudBaseUrl(ctx.cfg)}`);
     human.push(`  model         ${ctx.cfg.cloud.model}${ctx.cfg.cloud.cheapModel ? ` (cheap: ${ctx.cfg.cloud.cheapModel})` : ''}`);
-    human.push(`  api key       ${keyPresent ? style.green('present') : style.yellow('missing')}`);
+    human.push(
+      `  api key       ${
+        !keyRequired
+          ? style.dim('not required (self-hosted endpoint)')
+          : keyPresent
+            ? style.green('present')
+            : style.yellow('missing')
+      }`,
+    );
+    if (ctx.cfg.cloud.thinking !== undefined) {
+      human.push(
+        `  thinking      ${ctx.cfg.cloud.thinking ? 'on' : style.dim('off (faster; the model answers without reasoning first)')}`,
+      );
+    }
 
     // When a key is missing, show which provider keys *are* set. Without this, a
     // user with ANTHROPIC_API_KEY and the default OpenRouter provider sees only
@@ -181,7 +195,7 @@ const doctor: Command = {
       human.push(`  workspace id  ${ws ? style.green(ws) : style.dim('not set (only needed for unscoped keys)')}`);
     }
 
-    if (!keyPresent) {
+    if (!keyPresent && keyRequired) {
       const present = PROVIDER_PROFILES.filter((p) =>
         p.keyEnv.some((name) => Boolean(process.env[name]?.trim())),
       );
@@ -199,6 +213,7 @@ const doctor: Command = {
       model: ctx.cfg.cloud.model,
       cheapModel: ctx.cfg.cloud.cheapModel ?? null,
       keyPresent,
+      keyRequired,
       enabled: ctx.cfg.cloud.enabled,
       pricePerMTok: priceFor(ctx.cfg, ctx.cfg.cloud.model),
     };

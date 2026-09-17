@@ -202,6 +202,13 @@ export function autoSelectCloudProvider(
 ): { config: ProtoConfig; note?: string } {
   if (resolveApiKeyFor(cfg, dataDir)) return { config: cfg };
 
+  // A self-hosted endpoint needs no key, so "no key found" is not evidence that the
+  // configured provider is unusable. Without this, pointing proto at a vLLM box
+  // silently redirected every request to whichever hosted provider happened to have
+  // a key in secrets.json — a genuinely baffling way to fail, since the config file
+  // says one thing and the traffic goes somewhere else.
+  if (cfg.cloud.requiresKey === false) return { config: cfg };
+
   const alternatives = PROVIDER_PROFILES.filter((profile) => {
     if (profile.id === cfg.cloud.provider) return false;
     if (profile.id === 'custom') return false;
@@ -358,6 +365,12 @@ export function writeSecret(dataDir: string, provider: string, key: string): str
 }
 
 export function priceFor(cfg: ProtoConfig, model: string): Price {
+  // An explicit endpoint price wins over everything: it is the only source that can
+  // be right about a server nobody else has heard of.
+  if (cfg.cloud.price !== undefined) {
+    const p = cfg.cloud.price;
+    return { in: p.in, out: p.out, ...(p.cachedIn === undefined ? {} : { cachedIn: p.cachedIn }) };
+  }
   const exact = cfg.pricing[model];
   if (exact) return exact;
   // Try a provider-qualified fallback: "anthropic/claude-sonnet-4.5" -> "claude-sonnet-4-5".
@@ -366,6 +379,14 @@ export function priceFor(cfg: ProtoConfig, model: string): Price {
   // Prefix match, so dated snapshots inherit their family price.
   const hit = Object.entries(cfg.pricing).find(([k]) => model.startsWith(k) || k.startsWith(model));
   if (hit) return hit[1];
+
+  // A keyless endpoint is one you host: nobody is metering you per token, so the
+  // marginal cost of a call is genuinely zero. Falling through to UNKNOWN_PRICE here
+  // would make the router treat the fastest tier available as the most expensive one,
+  // which is both wrong and self-defeating. An endpoint that *is* metered but
+  // keyless should set `cloud.price` explicitly.
+  if (cfg.cloud.requiresKey === false) return { in: 0, out: 0 };
+
   return { in: 5, out: 20 };
 }
 

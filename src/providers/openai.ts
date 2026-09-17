@@ -46,6 +46,17 @@ export interface OpenAICompatibleOptions {
   supportsJsonSchema?: boolean;
   /** Local runtimes usually need no auth header at all. */
   requireKey?: boolean;
+  /**
+   * Ask for token usage on streamed responses (`stream_options.include_usage`).
+   * Standard on the hosted gateways and on vLLM; some self-hosted
+   * OpenAI-compatible servers reject the unknown field outright, which would break
+   * streaming entirely, so those callers turn it off.
+   */
+  streamUsage?: boolean;
+  /** Applied to every request that does not set `thinking` itself. */
+  defaultThinking?: boolean;
+  /** Merged into every request body, weakest of the three body sources. */
+  defaultExtraBody?: Record<string, unknown>;
   headers?: (req: ChatRequest) => Record<string, string>;
 }
 
@@ -71,6 +82,9 @@ export class OpenAICompatibleProvider implements Provider {
   private readonly extraHeaders: Record<string, string>;
   private readonly supportsJsonSchema: boolean;
   private readonly requireKey: boolean;
+  private readonly streamUsage: boolean;
+  private readonly defaultThinking: boolean | undefined;
+  private readonly defaultExtraBody: Record<string, unknown> | undefined;
   private readonly headerHook: ((req: ChatRequest) => Record<string, string>) | undefined;
 
   constructor(opts: OpenAICompatibleOptions) {
@@ -85,6 +99,9 @@ export class OpenAICompatibleProvider implements Provider {
     this.extraHeaders = opts.extraHeaders ?? {};
     this.supportsJsonSchema = opts.supportsJsonSchema ?? false;
     this.requireKey = opts.requireKey ?? opts.kind === 'cloud';
+    this.streamUsage = opts.streamUsage !== false;
+    this.defaultThinking = opts.defaultThinking;
+    this.defaultExtraBody = opts.defaultExtraBody;
     this.headerHook = opts.headers;
     this.capabilities = { ...DEFAULT_CAPS, ...(opts.capabilities ?? {}) };
   }
@@ -135,7 +152,28 @@ export class OpenAICompatibleProvider implements Provider {
         json_schema: { name: 'proto_output', strict: false, schema: req.jsonSchema },
       };
     }
+    this.applyThinking(body, req);
+    // Weakest to strongest: provider defaults, then the caller's own escape hatch.
+    // A request-level value must always be able to override a configured one, or a
+    // single call could not deviate from the session default.
+    if (this.defaultExtraBody) Object.assign(body, this.defaultExtraBody);
+    if (req.extraBody) Object.assign(body, req.extraBody);
     return body;
+  }
+
+  /**
+   * Translate the provider-agnostic `thinking` intent into this wire format.
+   *
+   * The spelling is not standardised. vLLM passes it through the chat template as
+   * `chat_template_kwargs.enable_thinking`, which is what Qwen3 and several other
+   * hybrid-reasoning models read. Endpoints that do not know the field ignore it,
+   * which is why this is safe to send unconditionally on OpenAI-compatible servers.
+   */
+  private applyThinking(body: Record<string, unknown>, req: ChatRequest): void {
+    const want = req.thinking ?? this.defaultThinking;
+    if (want === undefined) return;
+    const existing = (body['chat_template_kwargs'] ?? {}) as Record<string, unknown>;
+    body['chat_template_kwargs'] = { ...existing, enable_thinking: want };
   }
 
   async chat(req: ChatRequest): Promise<ChatResponse> {
@@ -201,6 +239,9 @@ export class OpenAICompatibleProvider implements Provider {
 
     const body = this.buildBody(req);
     body['stream'] = true;
+    // Without this, vLLM and most OpenAI-compatible servers send no `usage` at all
+    // on a streamed response, so token accounting and cost silently report zero.
+    if (this.streamUsage) body['stream_options'] = { include_usage: true };
 
     const started = Date.now();
     const controller = new AbortController();
@@ -250,6 +291,7 @@ export class OpenAICompatibleProvider implements Provider {
         const response = this.normalize(parsed, latencyMs, req);
         // Surface the whole completion as one delta so a streaming caller always
         // receives the content through the same callback, not just in the result.
+        if (response.reasoning) onEvent({ type: 'reasoning-delta', text: response.reasoning });
         if (response.text) onEvent({ type: 'text-delta', text: response.text });
         for (const toolCall of response.toolCalls) onEvent({ type: 'tool-call', toolCall });
         onEvent({ type: 'done', response });
@@ -257,6 +299,8 @@ export class OpenAICompatibleProvider implements Provider {
       }
 
       let text = '';
+      let reasoningText = '';
+      let guidance = '';
       let finish: FinishReason = 'stop';
       let model = this.model;
       let rawUsage: Record<string, unknown> | undefined;
@@ -288,6 +332,15 @@ export class OpenAICompatibleProvider implements Provider {
           onEvent({ type: 'text-delta', text: delta['content'] });
         }
 
+        // Reasoning arrives under two different names in the wild: vLLM/Qwen use
+        // `reasoning`, DeepSeek uses `reasoning_content`. Both are thinking, not
+        // answer, so neither is appended to `text`.
+        const reasoning = delta['reasoning'] ?? delta['reasoning_content'];
+        if (typeof reasoning === 'string' && reasoning) {
+          reasoningText += reasoning;
+          onEvent({ type: 'reasoning-delta', text: reasoning });
+        }
+
         if (Array.isArray(delta['tool_calls'])) {
           for (const raw of delta['tool_calls'] as unknown[]) {
             const tc = (raw ?? {}) as Record<string, unknown>;
@@ -307,6 +360,16 @@ export class OpenAICompatibleProvider implements Provider {
 
         if (first['finish_reason'] !== undefined && first['finish_reason'] !== null) {
           finish = mapFinish(first['finish_reason']);
+          // A reasoning model that hits `length` with nothing but thinking to show
+          // is not a transport failure and not really a model failure either: the
+          // budget was wrong. Say so, because the generic "empty message" error
+          // sends people looking in entirely the wrong place.
+          if (finish === 'length' && !text && reasoningText !== '') {
+            guidance =
+              `the model used its entire ${req.maxTokens ?? 'output'} token budget on reasoning ` +
+              `(${estimateTokens(reasoningText)} tokens) and never produced an answer. ` +
+              `Raise maxTokens, or disable thinking for this model.`;
+          }
         }
       };
 
@@ -359,7 +422,17 @@ export class OpenAICompatibleProvider implements Provider {
       if (reasoning !== undefined) usage.reasoningTokens = reasoning;
 
       let response: ChatResponse;
-      if (!text && toolCalls.length === 0 && finish === 'stop') {
+      if (guidance !== '') {
+        // Everything went into reasoning and the budget ran out. Reported as an
+        // error with the diagnosis attached, so the caller can see *why* there is
+        // no answer rather than the generic "empty message".
+        response = {
+          ...emptyResponse(this.id, model, latencyMs, guidance),
+          ...(reasoningText === '' ? {} : { reasoning: reasoningText }),
+          usage,
+          finishReason: 'error',
+        };
+      } else if (!text && toolCalls.length === 0 && finish === 'stop') {
         // Same rule as `normalize`: an empty completion is a model-level failure,
         // not a transport one, so it must not look like a successful stop.
         response = {
@@ -371,6 +444,7 @@ export class OpenAICompatibleProvider implements Provider {
         response = {
           text,
           toolCalls,
+          ...(reasoningText === '' ? {} : { reasoning: reasoningText }),
           usage,
           finishReason: finish,
           model,
@@ -396,6 +470,10 @@ export class OpenAICompatibleProvider implements Provider {
     const message = (first['message'] ?? {}) as Record<string, unknown>;
 
     const text = typeof message['content'] === 'string' ? message['content'] : '';
+    const reasoningText =
+      typeof message['reasoning'] === 'string' ? message['reasoning']
+      : typeof message['reasoning_content'] === 'string' ? message['reasoning_content']
+      : '';
     const toolCalls = normalizeToolCalls(message['tool_calls']);
     const rawUsage = (root?.['usage'] ?? {}) as Record<string, unknown>;
 
@@ -414,9 +492,26 @@ export class OpenAICompatibleProvider implements Provider {
     if (reasoning !== undefined) usage.reasoningTokens = reasoning;
 
     const finish = mapFinish(first['finish_reason']);
+
+    if (finish === 'length' && !text && reasoningText !== '') {
+      return {
+        ...emptyResponse(
+          this.id,
+          this.model,
+          latencyMs,
+          `the model used its entire ${req.maxTokens ?? 'output'} token budget on reasoning ` +
+            `and never produced an answer. Raise maxTokens, or disable thinking for this model.`,
+        ),
+        reasoning: reasoningText,
+        usage,
+        finishReason: 'error',
+      };
+    }
+
     if (!text && toolCalls.length === 0 && finish === 'stop') {
       return {
         ...emptyResponse(this.id, this.model, latencyMs, 'provider returned an empty message'),
+        ...(reasoningText === '' ? {} : { reasoning: reasoningText }),
         usage,
         finishReason: 'error',
       };
@@ -425,6 +520,7 @@ export class OpenAICompatibleProvider implements Provider {
     return {
       text,
       toolCalls,
+      ...(reasoningText === '' ? {} : { reasoning: reasoningText }),
       usage,
       finishReason: finish,
       model: typeof root?.['model'] === 'string' ? (root['model'] as string) : this.model,

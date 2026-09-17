@@ -166,6 +166,12 @@ export function buildCloudProvider(cfg: ProtoConfig, dataDir?: string, modelOver
     });
   }
 
+  // A self-hosted endpoint (a vLLM box on the LAN, a corporate gateway) usually has
+  // no authentication at all. Requiring a key there would make the fastest available
+  // tier unreachable for no security benefit, so the requirement is explicit config
+  // rather than a consequence of the tier being called "cloud".
+  const requiresKey = cfg.cloud.requiresKey !== false;
+
   return new OpenAICompatibleProvider({
     id: cfg.cloud.provider,
     label: profile?.label ?? cfg.cloud.provider,
@@ -177,6 +183,10 @@ export function buildCloudProvider(cfg: ProtoConfig, dataDir?: string, modelOver
     timeoutMs: cfg.cloud.requestTimeoutMs,
     extraHeaders,
     supportsJsonSchema: false,
+    requireKey: requiresKey,
+    ...(cfg.cloud.streamUsage === false ? { streamUsage: false } : {}),
+    ...(cfg.cloud.thinking === undefined ? {} : { defaultThinking: cfg.cloud.thinking }),
+    ...(cfg.cloud.extraBody === undefined ? {} : { defaultExtraBody: cfg.cloud.extraBody }),
   });
 }
 
@@ -194,9 +204,10 @@ export function buildProviders(cfg: ProtoConfig, dataDir?: string): ProviderSet 
 
   if (!cfg.cloud.enabled) {
     cloudUnavailable = 'cloud is disabled in config (set cloud.enabled=true or provide an API key)';
-  } else if (!resolveApiKeyFor(cfg, dataDir) && cloudApiShape(cfg) !== 'openai') {
-    cloudUnavailable = `no API key found for provider "${cfg.cloud.provider}"`;
-  } else if (!resolveApiKeyFor(cfg, dataDir)) {
+  } else if (!resolveApiKeyFor(cfg, dataDir) && cfg.cloud.requiresKey !== false) {
+    // A self-hosted endpoint needs no key, so its absence says nothing about
+    // availability. Asking for one regardless would make the fastest tier in the
+    // system unreachable on a technicality.
     cloudUnavailable = `no API key found for provider "${cfg.cloud.provider}"`;
   } else {
     cloud = buildCloudProvider(cfg, dataDir);

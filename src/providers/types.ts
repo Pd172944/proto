@@ -71,12 +71,33 @@ export interface ChatRequest {
   jsonSchema?: Record<string, unknown>;
   stop?: string[];
   signal?: AbortSignal;
+  /**
+   * Ask the model to think before answering, when it has such a mode.
+   *
+   * Provider-agnostic on purpose: the wire spelling differs (vLLM takes
+   * `chat_template_kwargs.enable_thinking`, other gateways take their own), and the
+   * harness should not have to know. `undefined` means "whatever the endpoint
+   * defaults to", which is what a caller who has not thought about it wants.
+   *
+   * `false` is the interesting value: a reasoning model on a latency budget is
+   * spending most of its tokens on thinking nobody reads. Measured on Qwen3.8-27B,
+   * turning it off took one short answer from 2.94s to 0.38s.
+   */
+  thinking?: boolean;
+  /** Extra fields merged into the request body verbatim. The escape hatch. */
+  extraBody?: Record<string, unknown>;
   /** Free-form metadata for logging (never sent to the provider). */
   meta?: Record<string, unknown>;
 }
 
 export interface ChatResponse {
   text: string;
+  /**
+   * Thinking the model emitted before its answer, when it emits any. Never part of
+   * `text`; present so a caller can show it, count it, or notice that a model spent
+   * its whole budget reasoning instead of working.
+   */
+  reasoning?: string;
   toolCalls: ToolCall[];
   usage: Usage;
   finishReason: FinishReason;
@@ -92,6 +113,16 @@ export interface ChatResponse {
 /** One incremental event from a streaming completion. */
 export type StreamEvent =
   | { type: 'text-delta'; text: string }
+  /**
+   * A reasoning/thinking token from a model that emits one (Qwen3 via vLLM sends
+   * `delta.reasoning`, DeepSeek sends `reasoning_content`).
+   *
+   * Kept separate from `text-delta` on purpose. Thinking is not the answer: mixing
+   * it into the assistant text would corrupt every transcript, every fingerprint of
+   * "did the model say anything useful", and every diff the harness tried to parse.
+   * Callers that do not care simply ignore this event.
+   */
+  | { type: 'reasoning-delta'; text: string }
   | { type: 'tool-call'; toolCall: ToolCall }
   | { type: 'done'; response: ChatResponse };
 

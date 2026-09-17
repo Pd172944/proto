@@ -736,6 +736,11 @@ describe('OpenAI chatStream', () => {
     assert.equal(plainBody['stream'], undefined);
     assert.equal(streamBody['stream'], true);
     delete streamBody['stream'];
+    // The only other difference is the usage request. Token accounting is worth
+    // having on a stream — without it every streamed call reports zero tokens and
+    // therefore zero cost — so this is a deliberate divergence, not drift.
+    assert.deepEqual(streamBody['stream_options'], { include_usage: true });
+    delete streamBody['stream_options'];
     assert.deepEqual(streamBody, plainBody);
   });
 });

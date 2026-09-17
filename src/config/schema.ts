@@ -252,10 +252,44 @@ export interface CloudConfig {
    * docs/interactive.md.
    */
   workspaceId?: string;
+  /**
+   * Whether the endpoint requires an API key. Default true.
+   *
+   * Set false for a self-hosted server — a vLLM box on the LAN, a local gateway —
+   * that authenticates by network position rather than by credential. Without this
+   * the tier is reported unavailable and never used, which is a confusing way to
+   * fail for a server that is answering on port 8000.
+   */
+  requiresKey?: boolean;
+  /**
+   * Ask for token usage on streamed responses (`stream_options.include_usage`).
+   * Default true. Turn it off for an OpenAI-compatible server that rejects the
+   * unknown field, which would otherwise break streaming entirely.
+   */
+  streamUsage?: boolean;
+  /**
+   * Whether the model should think before answering, when it has such a mode.
+   *
+   * Unset means "whatever the endpoint defaults to". On a reasoning model this is
+   * the largest latency lever there is: measured against Qwen3.8-27B, one short
+   * answer went from 2.94s to 0.38s with thinking disabled.
+   */
+  thinking?: boolean;
+  /** Extra fields merged verbatim into every cloud request body. */
+  extraBody?: Record<string, unknown>;
+  /**
+   * Price per million tokens for this endpoint, overriding the built-in table.
+   *
+   * Needed because a self-hosted server is not in the table, and the fallback for an
+   * unknown model (`UNKNOWN_PRICE`, $5/$20 per M) is deliberately pessimistic. Left
+   * unset on a keyless endpoint the effective price is 0: if nobody is metering you
+   * per token, charging the router a fictional rate only makes it avoid the fastest
+   * tier it has.
+   */
+  price?: { in: number; out: number; cachedIn?: number };
 }
 
 export interface RoutingConfig {
-  /** `heuristic` = rules only; `learned` = model only; `hybrid` = learned blended with rules. */
   /** Minimum probability the local model succeeds before we let it try. */
   qualityFloor: number;
   /** Minimum probability for *mutating* tasks with no automatic verifier. */
