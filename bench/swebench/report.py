@@ -42,8 +42,11 @@ def load_rows(run_id: str) -> Dict[str, object]:
     per_inst: Dict[str, float] = {}
     for m in metrics:
         per_inst[m["instance_id"]] = per_inst.get(m["instance_id"], 0.0) + (m.get("wall_s") or 0)
-    local_n: int = sum(1 for m in metrics if m.get("tier") == "local")
-    cloud_n: int = sum(1 for m in metrics if isinstance(m.get("tier"), str) and str(m["tier"]).startswith("cloud"))
+    local_n: int = sum(1 for m in metrics if m.get("tier") == "local" or m.get("local_accepted"))
+    cloud_n: int = sum(int(m.get("cloud_calls") or 0) for m in metrics)
+    if cloud_n == 0:
+        cloud_n = sum(1 for m in metrics if isinstance(m.get("tier"), str) and str(m["tier"]).startswith("cloud"))
+    sonnet: float = sum(float(m.get("sonnet_usd") or 0) for m in metrics)
     # Scouts are a separate local-model pass and do not appear as metrics rows.
     scout_n: int = sum(1 for p in run_dir.iterdir() if p.is_dir() and (p / "scout.out").exists())
     if scout_n == 0:
@@ -59,8 +62,15 @@ def load_rows(run_id: str) -> Dict[str, object]:
         "local_calls": local_n,
         "cloud_calls": cloud_n,
         "scout_calls": scout_n,
+        "sonnet_usd": sonnet,
         "attempts": len(metrics),
         "nonempty_patches": patches,
+        "local_tokens": sum(int(m.get("local_tokens") or 0) for m in metrics),
+        "cloud_tokens": sum(int(m.get("cloud_tokens") or 0) for m in metrics),
+        "local_in": sum(int(m.get("local_input_tokens") or 0) for m in metrics),
+        "local_out": sum(int(m.get("local_output_tokens") or 0) for m in metrics),
+        "cloud_in": sum(int(m.get("cloud_input_tokens") or 0) for m in metrics),
+        "cloud_out": sum(int(m.get("cloud_output_tokens") or 0) for m in metrics),
         "passed": [g["instance_id"] for g in grades if g.get("resolved")],
     }
 
@@ -74,13 +84,14 @@ def main() -> None:
         p.name for p in (BASE / "runs").iterdir() if (p / "metrics.jsonl").exists()
     )
     rows: List[Dict[str, object]] = [load_rows(i) for i in ids]
-    print("| run | resolved | cost | mean wall | local patches / local scouts / cloud | passed |")
-    print("|---|---|---|---|---|---|")
+    print("| run | resolved | billed / sonnet~$ | mean wall | local kept / scouts / cloud | tokens local / inkling | passed |")
+    print("|---|---|---|---|---|---|---|")
     for r in rows:
         print(
             f"| {r['run']} | {r['resolved']}/{r['n']} ({100 * r['rate']:.0f}%) | "
-            f"${r['cost']:.2f} | {r['mean_wall_s']:.0f}s | "
-            f"{r['local_calls']}/{r['scout_calls']}/{r['cloud_calls']} | {', '.join(r['passed']) or '—'} |"
+            f"${r['cost']:.2f} / ${r['sonnet_usd']:.2f} | {r['mean_wall_s']:.0f}s | "
+            f"{r['local_calls']}/{r['scout_calls']}/{r['cloud_calls']} | "
+            f"{r['local_tokens']:,} / {r['cloud_tokens']:,} | {', '.join(r['passed']) or '—'} |"
         )
     (BASE / "summary.json").write_text(json.dumps(rows, indent=2))
     print(f"\nwrote {BASE / 'summary.json'}")

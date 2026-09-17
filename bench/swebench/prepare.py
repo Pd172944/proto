@@ -20,8 +20,9 @@ import argparse
 import json
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 BASE: Path = Path("/data/prithvi/sweb")
 PYTHON: str = sys.executable
@@ -124,6 +125,7 @@ def main() -> None:
     parser.add_argument("--mirrors", action="store_true")
     parser.add_argument("--envs", action="store_true")
     parser.add_argument("--instances", type=Path, default=Path(__file__).parent / "instances.json")
+    parser.add_argument("--workers", type=int, default=1, help="parallel env builds")
     args = parser.parse_args()
 
     instances: List[dict] = json.loads(args.instances.read_text())
@@ -131,7 +133,14 @@ def main() -> None:
         for repo in sorted({i["repo"] for i in instances}):
             ensure_mirror(repo)
     if args.envs:
-        results: Dict[str, bool] = {i["instance_id"]: build_env(i) for i in instances}
+        if args.workers <= 1:
+            results: Dict[str, bool] = {i["instance_id"]: build_env(i) for i in instances}
+        else:
+            with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                pairs: List[Tuple[str, bool]] = list(
+                    pool.map(lambda inst: (inst["instance_id"], build_env(inst)), instances)
+                )
+            results = dict(pairs)
         ok = sum(results.values())
         print(f"\nenvs ready: {ok}/{len(results)}")
         for iid, good in results.items():

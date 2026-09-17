@@ -53,10 +53,35 @@ def numeric_suffix(instance_id: str) -> int:
     return int(instance_id.rsplit("-", 1)[1])
 
 
+def scaled_quotas(n: int) -> Dict[str, int]:
+    """Scale the base 10-task repo mix to ``n`` instances.
+
+    The original 10-task set is the most-recent slice of this mix, so n=40
+    keeps those ten as a prefix of each repo's quota.
+
+    Args:
+        n: Target instance count.
+
+    Returns:
+        Repo to quota mapping that sums to ``n``.
+    """
+    base_total: int = sum(REPO_QUOTA.values())
+    scaled: Dict[str, int] = {repo: (count * n) // base_total for repo, count in REPO_QUOTA.items()}
+    remainder: int = n - sum(scaled.values())
+    order: List[str] = sorted(REPO_QUOTA, key=lambda repo: REPO_QUOTA[repo], reverse=True)
+    idx: int = 0
+    while remainder > 0:
+        scaled[order[idx % len(order)]] += 1
+        remainder -= 1
+        idx += 1
+    return scaled
+
+
 def main() -> None:
     """Build the fixed instance set and write it as JSON."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, default=Path(__file__).parent / "instances.json")
+    parser.add_argument("--n", type=int, default=sum(REPO_QUOTA.values()), help="instance count (default: 10)")
     args = parser.parse_args()
 
     ds = load_dataset("princeton-nlp/SWE-bench_Verified", split="test")
@@ -64,10 +89,12 @@ def main() -> None:
     for row in ds:
         by_repo.setdefault(row["repo"], []).append(row)
 
+    quotas: Dict[str, int] = scaled_quotas(args.n)
     chosen: List[dict] = []
-    for repo, quota in REPO_QUOTA.items():
+    for repo, quota in quotas.items():
         rows = sorted(by_repo[repo], key=lambda r: numeric_suffix(r["instance_id"]), reverse=True)
-        for row in rows[:quota]:
+        take: int = min(quota, len(rows))
+        for row in rows[:take]:
             chosen.append({k: row[k] for k in FIELDS})
 
     chosen.sort(key=lambda r: r["instance_id"])

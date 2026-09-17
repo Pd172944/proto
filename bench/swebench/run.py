@@ -27,10 +27,14 @@ from typing import Dict, List, Optional, Tuple
 
 from pipeline import (
     adjacent_on_worktree,
-    cloud_repair,
+    cloud_finish,
     constraint_block,
-    local_verify,
     parse_scout_files,
+    reset_worktree,
+    run_proto,
+    should_try_local,
+    sonnet_usd,
+    is_inplace_patch,
 )
 
 BASE: Path = Path("/data/prithvi/sweb")
@@ -89,6 +93,37 @@ def git(args: List[str], cwd: Path) -> subprocess.CompletedProcess:
         Completed process.
     """
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=300)
+
+
+def usage_from_blob(blob: Optional[dict]) -> Tuple[int, int, int]:
+    """Read input / cached / output token counts from a proto ``--json`` blob.
+
+    Args:
+        blob: Parsed trailing JSON from ``proto code --json``, or None.
+
+    Returns:
+        ``(input_tokens, cached_input_tokens, output_tokens)``.
+    """
+    if not blob:
+        return 0, 0, 0
+    inner: dict = blob.get("stats", {}) if isinstance(blob.get("stats"), dict) else {}
+    return (
+        int(inner.get("inputTokens") or 0),
+        int(inner.get("cachedInputTokens") or 0),
+        int(inner.get("outputTokens") or 0),
+    )
+
+
+def usage_from_stdout(stdout: str) -> Tuple[int, int, int]:
+    """Read token counts from proto stdout that ends with a JSON stats document.
+
+    Args:
+        stdout: Full captured stdout.
+
+    Returns:
+        ``(input_tokens, cached_input_tokens, output_tokens)``.
+    """
+    return usage_from_blob(extract_trailing_json(stdout))
 
 
 def extract_trailing_json(stdout: str) -> Optional[dict]:
@@ -253,7 +288,7 @@ def collect_model_patch(repo_dir: Path) -> str:
 def scout_localize(instance: dict, inst_dir: Path, proto_home: Path, env: Dict[str, str]) -> str:
     """Run a short local-model scout to name likely files and the cause.
 
-    The scout is read-only and bounded (10 steps, 3 minutes) so it stays cheap
+    The scout is read-only and bounded (8 steps, 2 minutes) so it stays cheap
     and cannot dirty the worktree the main agent will edit. Its notes are
     injected into the main prompt so the cloud/local fixer does not spend its
     first ten steps rediscovering the change site.
@@ -282,9 +317,9 @@ def scout_localize(instance: dict, inst_dir: Path, proto_home: Path, env: Dict[s
         "--json",
         "--no-save",
         "--max-steps",
-        "14",
+        "8",
         "--deadline-min",
-        "3",
+        "2",
     ]
     try:
         proc = subprocess.run(cmd, cwd=repo_dir, env=env, capture_output=True, text=True, timeout=240)
@@ -355,6 +390,7 @@ def run_instance(instance: dict, run_dir: Path, args: argparse.Namespace, attemp
         # edits must be what its own test runs and repro scripts import.
         env["PYTHONPATH"] = str(repo_dir)
 
+    start: float = time.time()
     scout_note: str = ""
     if args.scout:
         if attempt == 0:
@@ -379,139 +415,150 @@ def run_instance(instance: dict, run_dir: Path, args: argparse.Namespace, attemp
             + prompt
         )
 
-    cmd: List[str] = [
-        str(PROTO / "bin" / "proto"),
-        "code",
-        prompt,
-        "--workspace",
-        str(repo_dir),
-        "--print",
-        "--yes",
-        "--json",
-        "--no-save",
-        "--max-steps",
-        str(args.max_steps),
-        "--deadline-min",
-        str(args.deadline_min),
-        "--budget-usd",
-        str(args.budget_usd),
-    ]
-    # Attempt 0 follows --mode. Extra attempts are cloud resamples at higher
-    # temperature. Local is reserved for the scout (localization), not for
-    # competing patches: a small local diff that happens not to break adjacent
-    # tests was beating complete cloud patches in selection.
-    if attempt == 0:
-        if args.mode == "local":
-            cmd.append("--local")
-        elif args.mode == "cloud":
-            cmd.append("--no-route")
-        else:
-            cmd.append("--escalate-on-stuck")
-    else:
-        cmd.extend(["--no-route", "--temperature", str(0.4 + 0.2 * (attempt % 3))])
-
-    start: float = time.time()
-    try:
-        proc = subprocess.run(
-            # Escalation can add a continuation turn, so allow two turn budgets.
-            cmd, cwd=repo_dir, env=env, capture_output=True, text=True, timeout=args.deadline_min * 60 + 180
-        )
-        timed_out = False
-    except subprocess.TimeoutExpired as exc:
-        proc = None
-        timed_out = True
-        (inst_dir / "agent.out").write_text((exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or ""))
-        (inst_dir / "agent.err").write_text((exc.stderr or b"").decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or ""))
-    wall_s: float = time.time() - start
-
+    timed_out: bool = False
     stats: Optional[dict] = None
-    if proc is not None:
-        (inst_dir / "agent.out").write_text(proc.stdout)
-        (inst_dir / "agent.err").write_text(proc.stderr)
-        stats = extract_trailing_json(proc.stdout)
+    local_accepted: bool = False
+    cloud_calls: int = 0
+    cloud_in: int = 0
+    cloud_cached: int = 0
+    cloud_out: int = 0
+    local_in: int = 0
+    local_cached: int = 0
+    local_out: int = 0
+    local_calls: int = 1 if (args.scout and attempt == 0) else 0
+    fixer: str = "cloud-strong"
+    adj_log: str = ""
+    patch: str = ""
 
-    # Production-source diff only: drop repro scripts the agent left in-tree.
-    patch: str = collect_model_patch(repo_dir)
+    def add_cloud_stats(blob: Optional[dict]) -> None:
+        """Accumulate token counts from a cloud proto JSON blob."""
+        nonlocal cloud_in, cloud_cached, cloud_out, stats
+        if not blob:
+            return
+        stats = blob
+        cin, ccached, cout = usage_from_blob(blob)
+        cloud_in += cin
+        cloud_cached += ccached
+        cloud_out += cout
 
-    # If the model only wrote a repro script, one follow-up turn on the same
-    # worktree asking it to actually edit library source. Cheap, and it is the
-    # observed failure on xarray-style tasks.
-    if not patch.strip() and not timed_out:
-        scrub_junk_files(repo_dir)
-        follow_prompt: str = (
-            "You wrote a reproduction script but did not change any production source. "
-            "The issue is still present. Use find_symbol on the names in the issue, then "
-            "edit_file on an existing library module (not tests, not a new file at repo root) "
-            "so the reported behavior is fixed, then stop."
-        )
-        if scout_note:
-            follow_prompt = (
-                constraint_block(scout_paths)
-                + "A local scout already named likely files. Start there.\n\n"
-                f"<scout>\n{scout_note}\n</scout>\n\n"
-                + follow_prompt
-            )
-        follow: List[str] = [
-            str(PROTO / "bin" / "proto"),
-            "code",
-            follow_prompt,
-            "--workspace",
-            str(repo_dir),
-            "--print",
-            "--yes",
-            "--json",
-            "--no-save",
-            "--no-route",
-            "--max-steps",
-            "25",
-            "--deadline-min",
-            "5",
-        ]
-        try:
-            proc2 = subprocess.run(follow, cwd=repo_dir, env=env, capture_output=True, text=True, timeout=300)
-            (inst_dir / "agent.follow.out").write_text(proc2.stdout)
-            (inst_dir / "agent.follow.err").write_text(proc2.stderr)
-            if proc is not None:
-                proc = proc2
-            stats = extract_trailing_json(proc2.stdout) or stats
-        except subprocess.TimeoutExpired:
-            pass
-        patch = collect_model_patch(repo_dir)
-        wall_s = time.time() - start
+    def add_local_from_file(path: Path) -> None:
+        """Accumulate local-model tokens from a captured proto stdout file."""
+        nonlocal local_in, local_cached, local_out
+        if not path.exists():
+            return
+        lin, lcached, lout = usage_from_stdout(path.read_text())
+        local_in += lin
+        local_cached += lcached
+        local_out += lout
 
-    repaired: bool = False
-    verify_passed: Optional[bool] = None
-    if (
+    try_local: bool = (
         args.scout
-        and not args.no_verify
-        and has_env
-        and patch.strip()
-        and not timed_out
-    ):
-        adj_ok: bool
-        adj_log: str
+        and args.mode != "cloud"
+        and attempt == 0
+        and should_try_local(scout_paths)
+    )
+
+    if args.mode == "local" or try_local:
         try:
-            adj_ok, adj_log = adjacent_on_worktree(instance, repo_dir, env, patch)
-        except subprocess.TimeoutExpired:
-            adj_ok, adj_log = True, "adjacent tests timed out; skipped"
-        (inst_dir / "verify.adjacent.txt").write_text(adj_log)
-        v_ok: bool
-        v_log: str
-        v_ok, v_log = local_verify(instance, repo_dir, env, patch, inst_dir)
-        verify_passed = adj_ok and v_ok
-        if not verify_passed:
-            evidence: str = (
-                "ADJACENT TESTS:\n" + adj_log + "\n\nLOCAL REPRO:\n" + v_log
+            proc = run_proto(
+                prompt,
+                repo_dir,
+                env,
+                max_steps=12 if try_local else args.max_steps,
+                deadline_min=1.5 if try_local else args.deadline_min,
+                timeout_s=100 if try_local else int(args.deadline_min * 60) + 180,
+                local=True,
             )
-            (inst_dir / "verify.evidence.txt").write_text(evidence)
-            cloud_repair(instance, repo_dir, env, scout_paths, evidence, inst_dir)
+        except subprocess.TimeoutExpired:
+            proc = None
+            timed_out = True
+        local_calls += 1
+        if proc is not None:
+            (inst_dir / "agent.local.out").write_text(proc.stdout)
+            (inst_dir / "agent.local.err").write_text(proc.stderr)
+            stats = extract_trailing_json(proc.stdout)
+        scrub_junk_files(repo_dir)
+        patch = collect_model_patch(repo_dir)
+        accepted: bool = False
+        if patch.strip() and has_env and not timed_out:
+            try:
+                ok, adj_log, had = adjacent_on_worktree(instance, repo_dir, env, patch)
+            except subprocess.TimeoutExpired:
+                ok, adj_log, had = False, "adjacent tests timed out", False
+            (inst_dir / "verify.adjacent.txt").write_text(adj_log)
+            accepted = bool(ok and had and is_inplace_patch(patch))
+        if accepted:
+            local_accepted = True
+            fixer = "local"
+        elif args.mode != "local":
+            failed_diff: str = patch
+            reset_worktree(repo_dir)
+            scrub_junk_files(repo_dir)
+            proc_c = cloud_finish(
+                instance,
+                repo_dir,
+                env,
+                scout_paths,
+                scout_note,
+                failed_diff,
+                adj_log,
+                inst_dir,
+                max_steps=args.max_steps,
+                deadline_min=args.deadline_min,
+            )
+            cloud_calls += 1
+            if proc_c is not None:
+                add_cloud_stats(extract_trailing_json(proc_c.stdout))
             scrub_junk_files(repo_dir)
             patch = collect_model_patch(repo_dir)
-            repaired = True
-            wall_s = time.time() - start
+            fixer = "cloud-escalated"
+    else:
+        proc_c = cloud_finish(
+            instance,
+            repo_dir,
+            env,
+            scout_paths,
+            scout_note,
+            "",
+            "",
+            inst_dir,
+            max_steps=args.max_steps,
+            deadline_min=args.deadline_min,
+        )
+        cloud_calls += 1
+        if proc_c is None:
+            timed_out = True
+        else:
+            add_cloud_stats(extract_trailing_json(proc_c.stdout))
+        scrub_junk_files(repo_dir)
+        patch = collect_model_patch(repo_dir)
+        fixer = "cloud-direct"
+        if not patch.strip() and not timed_out:
+            proc2 = cloud_finish(
+                instance,
+                repo_dir,
+                env,
+                scout_paths,
+                scout_note,
+                "",
+                "Previous cloud turn wrote no production source. Edit an existing library file.",
+                inst_dir,
+                max_steps=20,
+                deadline_min=4,
+            )
+            cloud_calls += 1
+            if proc2 is not None:
+                add_cloud_stats(extract_trailing_json(proc2.stdout))
+            scrub_junk_files(repo_dir)
+            patch = collect_model_patch(repo_dir)
 
+    add_local_from_file(inst_dir / "scout.out")
+    add_local_from_file(inst_dir / "agent.local.out")
+    wall_s: float = time.time() - start
     combined: str = "".join(
-        (inst_dir / name).read_text() for name in ("agent.out", "agent.err") if (inst_dir / name).exists()
+        (inst_dir / name).read_text()
+        for name in ("agent.out", "agent.err", "agent.local.out", "agent.local.err")
+        if (inst_dir / name).exists()
     )
     routing: Dict[str, object] = parse_routing(combined)
     session_stats: dict = (stats or {}).get("stats", {}) if isinstance(stats, dict) else {}
@@ -528,22 +575,32 @@ def run_instance(instance: dict, run_dir: Path, args: argparse.Namespace, attemp
         "cached_input_tokens": session_stats.get("cachedInputTokens"),
         "output_tokens": session_stats.get("outputTokens"),
         "scout_files": scout_paths,
-        "verify_passed": verify_passed,
-        "repaired": repaired,
+        "local_accepted": local_accepted,
+        "local_calls": local_calls,
+        "cloud_calls": cloud_calls,
+        "fixer": fixer,
+        "sonnet_usd": round(sonnet_usd(cloud_in, cloud_cached, cloud_out), 4),
+        "cloud_input_tokens": cloud_in,
+        "cloud_cached_tokens": cloud_cached,
+        "cloud_output_tokens": cloud_out,
+        "local_input_tokens": local_in,
+        "local_cached_tokens": local_cached,
+        "local_output_tokens": local_out,
+        "local_tokens": local_in + local_out,
+        "cloud_tokens": cloud_in + cloud_out,
+        "total_tokens": local_in + local_out + cloud_in + cloud_out,
         **routing,
     }
+    if local_accepted:
+        row["tier"] = "local"
+    elif cloud_calls:
+        row["tier"] = "cloud-strong"
     (inst_dir / "patch.diff").write_text(patch)
-    extra: str = ""
-    if repaired:
-        extra = " repaired"
-    elif verify_passed is False:
-        extra = " verify-fail"
-    elif verify_passed is True:
-        extra = " verified"
     print(
-        f"  {iid}: {'TIMEOUT' if timed_out else 'ok' if row['exit_ok'] else 'ERR'} "
-        f"patch={len(patch)}B cost=${session_stats.get('costUsd', 0) or 0:.3f} "
-        f"steps={session_stats.get('steps')} tier={routing.get('tier', '?')} {wall_s:.0f}s{extra}"
+        f"  {iid}: {'TIMEOUT' if timed_out else 'ok'} "
+        f"patch={len(patch)}B fixer={fixer} "
+        f"tokens local={row['local_tokens']} inkling={row['cloud_tokens']} "
+        f"{wall_s:.0f}s"
     )
     return row
 
@@ -560,8 +617,8 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=5)
     parser.add_argument("--attempts", type=int, default=1)
     parser.add_argument("--only", type=str, default=None, help="comma-separated instance ids")
-    parser.add_argument("--scout", action="store_true", help="local localization scout, then local verify + cloud repair on failure")
-    parser.add_argument("--no-verify", action="store_true", help="with --scout, skip the local verify / cloud repair phases")
+    parser.add_argument("--scout", action="store_true", help="local-first: tight scout then local patch, escalate to cloud only if adjacent tests fail")
+    parser.add_argument("--no-verify", action="store_true", help="unused; kept for flag compatibility")
     args = parser.parse_args()
 
     instances: List[dict] = json.loads(args.instances.read_text())
@@ -606,8 +663,14 @@ def main() -> None:
             fh.write(json.dumps(row) + "\n")
 
     total_cost = sum(r["cost_usd"] or 0 for r in rows)
+    sonnet = sum(r.get("sonnet_usd") or 0 for r in rows)
     nonempty = sum(1 for r in rows if r["patch_bytes"] > 0)
-    print(f"\ndone: {nonempty}/{len(rows)} non-empty patches across attempts, total cost ${total_cost:.2f}")
+    local_kept = sum(1 for r in rows if r.get("local_accepted"))
+    cloud_n = sum(r.get("cloud_calls") or 0 for r in rows)
+    print(
+        f"\ndone: {nonempty}/{len(rows)} non-empty, local-kept {local_kept}/{len(rows)}, "
+        f"cloud_calls={cloud_n}, billed ${total_cost:.2f}, hypothetical Sonnet ${sonnet:.2f}"
+    )
     print(f"predictions: {run_dir / 'preds.json'}")
 
 

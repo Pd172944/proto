@@ -1,15 +1,19 @@
-"""Subtask split: local localize/verify, cloud patch/repair.
+"""Cost-aware split: local-first when localized, cloud only on escalate.
 
-The SWE-bench runner keeps one model in charge of each phase so GPU 7 does
-the cheap I/O and the cloud model only spends tokens on the edit:
+Objective: match a Sonnet-only resolve rate while spending cloud tokens only
+when the local model cannot finish, without adding wall clock versus
+always-cloud.
 
-1. **Localize** (Ornith, read-only) already lives in ``run.scout_localize``.
-2. **Patch** (cloud) is the main ``proto code`` turn, constrained to scout files.
-3. **Check** (this module): adjacent existing tests plus a local-model repro.
-4. **Repair** (cloud, only on failure): one more edit turn with the traceback.
+django-17029 already proved the cheap path: Ornith, 19s, $0, 13 steps. Rule:
 
-Local never proposes a competing patch. A failed local check discards nothing
-that already landed; it only asks cloud to revise the worktree in place.
+- A tight scout (≤2 production files) → local patch with a hard 2-minute cap.
+- Adjacent existing tests must pass or the local diff is discarded (reset the
+  worktree) and one cloud call finishes, given the scout + failed diff.
+- Unlocalized tasks skip local patching and go to cloud immediately, so we do
+  not pay 2 minutes of Ornith on a task the cloud model would have solved anyway.
+
+Hypothetical Sonnet spend uses cloud token counts at list prices
+($3 / $0.30 / $15 per M uncached-in / cached-in / out).
 """
 
 from __future__ import annotations
@@ -21,6 +25,25 @@ from typing import Dict, List, Optional, Tuple
 
 BASE: Path = Path("/data/prithvi/sweb")
 PROTO: Path = Path("/data/prithvi/proto")
+
+NEW_DEF: re.Pattern[str] = re.compile(r"^\+\s*(?:async def |def |class )")
+
+
+def is_inplace_patch(patch: str) -> bool:
+    """True when a local diff only edits existing code (no new def/class).
+
+    Ornith's adjacent-test-passing failures on this set have been new helpers
+    (sympy visit_Compare) that nearby tests do not cover. The proven local win
+    (django-17029) is a few lines inside an existing method.
+
+    Args:
+        patch: Unified diff.
+
+    Returns:
+        Whether the patch is safe to keep without a cloud pass.
+    """
+    return not any(NEW_DEF.match(line) for line in patch.splitlines())
+
 
 FILE_BULLET: re.Pattern[str] = re.compile(
     r"^[\-\*]\s+((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.(?:py|c|h|cpp|js|ts|go|rs))\s*$"
@@ -132,11 +155,54 @@ def run_proto(
     return subprocess.run(cmd, cwd=repo_dir, env=env, capture_output=True, text=True, timeout=timeout_s)
 
 
-def adjacent_on_worktree(instance: dict, repo_dir: Path, env: Dict[str, str], patch: str) -> Tuple[bool, str]:
+def should_try_local(files: List[str]) -> bool:
+    """Whether a scout is tight enough that a 2-minute local patch is worth it.
+
+    Exactly one named production file is the django-17029 shape (Ornith, 19s,
+    $0). Two-plus files means the scout is still spreading its bets; a local
+    attempt there serializes into the cloud call and costs wall clock that a
+    Sonnet-only run would not pay, and it is where we lost django-17084.
+
+    Args:
+        files: Scout-named production paths.
+
+    Returns:
+        True when a bounded local patch should run before any cloud call.
+    """
+    return len(files) == 1
+
+
+def reset_worktree(repo_dir: Path) -> None:
+    """Drop a failed local diff so the cloud fixer starts from HEAD.
+
+    Args:
+        repo_dir: Agent checkout.
+    """
+    subprocess.run(["git", "reset", "--hard", "-q", "HEAD"], cwd=repo_dir, check=True, timeout=60)
+    subprocess.run(["git", "clean", "-fdq"], cwd=repo_dir, check=True, timeout=60)
+
+
+def sonnet_usd(input_tokens: int, cached_tokens: int, output_tokens: int) -> float:
+    """Hypothetical Claude Sonnet 4.5 bill for a cloud call's token counts.
+
+    Args:
+        input_tokens: Total input tokens (including cached).
+        cached_tokens: Cached input tokens.
+        output_tokens: Output tokens.
+
+    Returns:
+        USD at list prices ($3 / $0.30 / $15 per million).
+    """
+    cached: int = max(0, cached_tokens)
+    uncached: int = max(0, input_tokens - cached)
+    return (uncached * 3.0 + cached * 0.3 + max(0, output_tokens) * 15.0) / 1_000_000.0
+
+
+def adjacent_on_worktree(instance: dict, repo_dir: Path, env: Dict[str, str], patch: str) -> Tuple[bool, str, bool]:
     """Run existing tests near the touched files on the live worktree.
 
-    This is the check a real user has: did we break nearby tests? Hidden
-    FAIL_TO_PASS tests are never used.
+    Absence of adjacent tests is not a pass: a local patch with nothing to
+    check is escalated rather than kept.
 
     Args:
         instance: Instance row.
@@ -145,20 +211,20 @@ def adjacent_on_worktree(instance: dict, repo_dir: Path, env: Dict[str, str], pa
         patch: Current production diff.
 
     Returns:
-        ``(passed, log)``. No adjacent tests is treated as a pass.
+        ``(passed, log, had_tests)``.
     """
     from select_patch import django_labels, guess_test_files, touched_source_files
 
     if not patch.strip():
-        return False, "empty production patch"
+        return False, "empty production patch", False
     iid: str = instance["instance_id"]
     python: str = str(BASE / "envs" / iid / "bin" / "python")
     touched: List[str] = touched_source_files(patch)
-    timeout: int = 60
+    timeout: int = 45
     if instance["repo"] == "django/django":
         labels: List[str] = django_labels(repo_dir, touched)
         if not labels:
-            return True, "no adjacent django labels"
+            return False, "no adjacent django labels", False
         res = subprocess.run(
             [python, "tests/runtests.py", "--verbosity", "0", "--parallel", "1", *labels],
             cwd=repo_dir,
@@ -170,7 +236,7 @@ def adjacent_on_worktree(instance: dict, repo_dir: Path, env: Dict[str, str], pa
     else:
         test_files: List[str] = guess_test_files(instance["repo"], repo_dir, touched)
         if not test_files:
-            return True, "no adjacent test files"
+            return False, "no adjacent test files", False
         res = subprocess.run(
             [python, "-m", "pytest", "-q", "--no-header", "-x", "-p", "no:cacheprovider", *test_files],
             cwd=repo_dir,
@@ -180,7 +246,7 @@ def adjacent_on_worktree(instance: dict, repo_dir: Path, env: Dict[str, str], pa
             timeout=timeout,
         )
     log: str = (res.stdout + "\n" + res.stderr)[-2500:]
-    return res.returncode == 0, log
+    return res.returncode == 0, log, True
 
 
 def parse_verify_status(stdout: str) -> Optional[bool]:
@@ -264,45 +330,67 @@ def local_verify(
     return status, evidence
 
 
-def cloud_repair(
+def cloud_finish(
     instance: dict,
     repo_dir: Path,
     env: Dict[str, str],
     files: List[str],
+    scout_note: str,
+    failed_diff: str,
     evidence: str,
     inst_dir: Path,
-) -> None:
-    """One cloud turn to revise the worktree after a failed local check.
+    *,
+    max_steps: int,
+    deadline_min: float,
+) -> Optional[subprocess.CompletedProcess]:
+    """One cloud patch call after a discarded local attempt (or instead of one).
 
     Args:
         instance: Instance row.
-        repo_dir: Already-patched checkout to revise in place.
+        repo_dir: Clean (or current) checkout.
         env: Agent environment.
         files: Scout-constrained paths.
-        evidence: Adjacent-test and/or repro output.
-        inst_dir: Where to store the repair transcript.
+        scout_note: Salvaged scout text.
+        failed_diff: Local diff that was reset, if any.
+        evidence: Adjacent-test log from the local attempt.
+        inst_dir: Artifact directory.
+        max_steps: Cloud step budget.
+        deadline_min: Cloud deadline.
+
+    Returns:
+        Completed process, or None on timeout.
     """
-    prompt: str = (
-        constraint_block(files)
-        + "A local check of the current tree says the issue is still present or "
-        "adjacent tests failed. Do not rewrite the whole patch from scratch. "
-        "Read the failing evidence, then edit_file on existing library source so "
-        "the reported behavior holds. Never modify tests. Never create files at "
-        "the repository root.\n\n"
-        f"<issue>\n{instance['problem_statement'].strip()[:2500]}\n</issue>\n\n"
-        f"<evidence>\n{evidence[-2000:]}\n</evidence>\n"
+    parts: List[str] = [constraint_block(files)]
+    if scout_note:
+        parts.append(f"<scout>\n{scout_note[-2000:]}\n</scout>\n")
+    if failed_diff.strip():
+        parts.append(
+            "A local model already attempted a patch and it was rejected "
+            "(empty, or adjacent tests failed). The worktree is reset to HEAD. "
+            "Do not repeat that diff. Here is what it tried:\n```\n"
+            f"{failed_diff[:2500]}\n```\n"
+        )
+        if evidence:
+            parts.append(f"<evidence>\n{evidence[-1500:]}\n</evidence>\n")
+    parts.append(
+        f"Fix the issue in {instance['repo']}. Edit existing library source only. "
+        "Never modify tests. Never create files at the repository root. "
+        "Reproduction scripts belong in /tmp.\n\n"
+        f"<issue>\n{instance['problem_statement'].strip()[:3500]}\n</issue>\n"
     )
+    prompt: str = "\n".join(parts)
     try:
         proc = run_proto(
             prompt,
             repo_dir,
             env,
-            max_steps=25,
-            deadline_min=5,
-            timeout_s=360,
+            max_steps=max_steps,
+            deadline_min=deadline_min,
+            timeout_s=int(deadline_min * 60) + 120,
             no_route=True,
         )
     except subprocess.TimeoutExpired:
-        return
-    (inst_dir / "repair.out").write_text(proc.stdout)
-    (inst_dir / "repair.err").write_text(proc.stderr)
+        return None
+    (inst_dir / "agent.out").write_text(proc.stdout)
+    (inst_dir / "agent.err").write_text(proc.stderr)
+    return proc
