@@ -12,7 +12,10 @@ import { MockProvider } from '../providers/mock.ts';
 import { routeTask } from '../router/index.ts';
 import { heuristicScore } from '../router/heuristic.ts';
 import type { TaskContext, Tier } from '../router/types.ts';
-import { runTask } from '../harness/loop.ts';
+import { applyToWorkspace, runTask } from '../harness/loop.ts';
+import { runSplitOnce } from '../harness/split.ts';
+import { verifyCandidate } from '../verify/index.ts';
+import { extractFeatures } from '../router/features.ts';
 import { PROVIDER_PROFILES, providerProfile } from '../config/schema.ts';
 import { cloudBaseUrl, priceFor, resolveApiKeyFor, saveConfig, writeSecret } from '../config/load.ts';
 import { formatBytes, formatDuration, readTextOrNull, resolvePath, fileExists } from '../util/fsx.ts';
@@ -495,6 +498,8 @@ const run: Command = {
     { name: 'unload', type: 'boolean', description: 'ask the local runtime to unload the model when finished' },
     { name: 'mock', type: 'boolean', description: 'use deterministic mock providers (no network, no local runtime)' },
     { name: 'show-output', type: 'boolean', description: 'print the raw model output' },
+    { name: 'split', type: 'boolean', description: 'the cloud model plans, the local model writes the edits' },
+    { name: 'split-concurrency', type: 'number', description: 'executor calls in flight at once (default 4)' },
   ],
   async run(ctx): Promise<CommandResult> {
     const built = buildTaskContext(ctx);
@@ -509,6 +514,142 @@ const run: Command = {
     }
 
     const useMock = flagBool(ctx.args, 'mock');
+
+    /*
+     * The plan/execute split.
+     *
+     * A different shape of run, not a different tier: the cloud model produces a plan
+     * once, the local model carries out each step, and the assembled result goes
+     * through the same verifier as any other candidate. Kept as a separate branch
+     * rather than folded into `runTask` because the two do not share a control flow —
+     * there is no tool loop here and never will be.
+     */
+    if (flagBool(ctx.args, 'split') && !flagBool(ctx.args, 'dry-run')) {
+      const providers = buildProviders(ctx.cfg, ctx.dataDir);
+      if (!providers.cloud) {
+        throw new Error(`--split needs a cloud tier to plan: ${providers.cloudUnavailable ?? 'unavailable'}`);
+      }
+      const localOk = await providers.local.health();
+      if (!localOk.ok) {
+        throw new Error(`--split needs a working local model to execute: ${localOk.detail}`);
+      }
+
+      const features = extractFeatures(taskCtx);
+      const human: string[] = [style.bold('run (split: cloud plans, local executes)'), ''];
+      const plannerMs: number[] = [];
+      let executorMs = 0;
+
+      let keptPlan: Awaited<ReturnType<typeof runSplitOnce>>['plan'] | undefined;
+
+      const runOnce = async (feedback?: Map<string, string[]>): Promise<{ split: Awaited<ReturnType<typeof runSplitOnce>>; report: Awaited<ReturnType<typeof verifyCandidate>> }> => {
+        const split = await runSplitOnce(
+          {
+            cfg: ctx.cfg,
+            dataDir: ctx.dataDir,
+            ctx: taskCtx,
+            planner: providers.cloud as NonNullable<typeof providers.cloud>,
+            executor: providers.local,
+            ...(flagNumber(ctx.args, 'split-concurrency') !== undefined
+              ? { concurrency: flagNumber(ctx.args, 'split-concurrency') }
+              : {}),
+            onEvent: (e) => {
+              if (e.type === 'planned') {
+                human.push(`  plan          ${e.plan.summary || '(no summary)'}  ${style.dim(`in ${(e.plannerMs / 1000).toFixed(2)}s`)}`);
+                for (const step of e.plan.steps) human.push(`    ${style.cyan(step.file)}  ${step.intent}`);
+              } else if (e.type === 'execute-end') {
+                const mark = e.ok ? style.green('ok  ') : style.red('fail');
+                human.push(
+                  `  ${mark} ${e.file} ${style.dim(`${(e.durationMs / 1000).toFixed(2)}s`)}` +
+                    `${e.edits !== undefined && e.edits > 0 ? style.dim(` ${e.edits} edit(s)`) : ''}${e.error ? ` — ${e.error}` : ''}`,
+                );
+              }
+            },
+          },
+          undefined,
+          feedback,
+          keptPlan,
+        );
+        if (keptPlan === undefined) keptPlan = split.plan;
+        plannerMs.push(split.plannerMs);
+        executorMs += split.executorMs;
+
+        const report = await verifyCandidate({
+          text: split.candidateText,
+          ctx: taskCtx,
+          cfg: ctx.cfg,
+          dataDir: ctx.dataDir,
+          features,
+        });
+        return { split, report };
+      };
+
+      let { split, report } = await runOnce();
+
+      /*
+       * Retry the executor, not the planner, when verification fails.
+       *
+       * An ambiguous anchor or a dropped edit is a local mistake with a local fix, and
+       * the fix is cheap: re-running one step on the local model costs seconds and no
+       * money. Re-planning the whole task on the cloud model to correct one `find`
+       * string spends the expensive resource on the cheap model's error.
+       */
+      const maxRetries = flagBool(ctx.args, 'no-repair') ? 0 : 2;
+      for (let attempt = 1; attempt <= maxRetries && !report.passed; attempt++) {
+        const feedback = new Map<string, string[]>();
+        for (const blocker of report.blockers) {
+          // Blockers read "<path>: <reason>"; fall back to every step if unparseable.
+          const m = blocker.match(/^([^\s:]+\.[A-Za-z0-9]+):\s*(.*)$/);
+          const file = m?.[1] ?? split.plan.steps[0]?.file ?? '';
+          const reason = m?.[2] ?? blocker;
+          if (file === '') continue;
+          feedback.set(file, [...(feedback.get(file) ?? []), reason]);
+        }
+        human.push('');
+        human.push(
+          `  ${style.yellow('retry')}       executor again after verification failed` +
+            style.dim(` (attempt ${attempt + 1})`),
+        );
+        ({ split, report } = await runOnce(feedback.size > 0 ? feedback : undefined));
+      }
+
+      human.push('');
+      human.push(
+        `  planner       ${providers.cloud.model}  ${(plannerMs.reduce((a, b) => a + b, 0) / 1000).toFixed(2)}s` +
+          (plannerMs.length > 1 ? style.dim(` across ${plannerMs.length} call(s)`) : ''),
+      );
+      human.push(
+        `  executor      ${providers.local.model}  ${(executorMs / 1000).toFixed(2)}s wall, ` +
+          `${split.steps.length} step(s), ${split.executorInputTokens}↓ ${split.executorOutputTokens}↑ tokens`,
+      );
+      human.push(
+        `  total         ${((plannerMs.reduce((a, b) => a + b, 0) + executorMs) / 1000).toFixed(2)}s` +
+          `  ${style.dim('(steps run concurrently, so this is not a sum of latencies)')}`,
+      );
+      for (const w of split.warnings) human.push(`  ${style.yellow('note')}        ${w}`);
+      human.push('');
+      human.push(style.bold(`verification: ${renderVerification(report, ctx.cfg.verify.runTests)}`));
+      for (const c of report.checks) {
+        if (c.ok && c.severity === 'info') continue;
+        const icon = c.ok ? style.dim('~') : c.severity === 'error' ? style.red('x') : style.yellow('!');
+        human.push(`  ${icon} ${c.detail}`);
+      }
+      if (!ctx.cfg.verify.runTests) {
+        human.push(
+          `  ${style.yellow('!')} a well-formed edit is not a correct one. Enable tests to check behaviour: ` +
+            style.dim('proto config set verify.runTests true'),
+        );
+      }
+      if (flagBool(ctx.args, 'show-output')) human.push('', style.dim(split.candidateText));
+      if (flagBool(ctx.args, 'apply') && report.passed) {
+        const written = applyToWorkspace(report, taskCtx);
+        human.push('', `wrote ${written.join(', ')}`);
+      } else if (flagBool(ctx.args, 'apply')) {
+        human.push('', style.yellow('refusing to write: verification did not pass'));
+      } else {
+        human.push('', style.dim('nothing written (dry); re-run with --apply to write'));
+      }
+      return { human, json: { ok: report.passed, split, report }, exitCode: report.passed ? 0 : 3 };
+    }
 
     const result = await runTask({
       cfg: ctx.cfg,
@@ -538,7 +679,7 @@ const run: Command = {
 
     if (result.report) {
       human.push('');
-      human.push(style.bold(`verification: ${result.report.passed ? style.green('passed') : style.red('failed')} (score ${result.report.score.toFixed(2)})`));
+      human.push(style.bold(`verification: ${renderVerification(result.report, ctx.cfg.verify.runTests)}`));
       for (const c of result.report.checks) {
         if (c.ok && c.severity === 'info') continue;
         const icon = c.ok ? style.dim('~') : c.severity === 'error' ? style.red('x') : style.yellow('!');
@@ -578,6 +719,22 @@ const run: Command = {
     return { human, json: { ok: result.status !== 'failed', result }, exitCode };
   },
 };
+
+/**
+ * Say what verification actually established.
+ *
+ * "passed" on its own is misleading: without the project's tests enabled the verifier
+ * checks that the edit is well formed — anchors resolve, the file still parses, no
+ * forbidden patterns — and says nothing about whether the code now does the right
+ * thing. A split run produced a perfectly well-formed edit that fixed one of two bugs
+ * and reported `passed (score 1.00)`, which is exactly the kind of true-but-useless
+ * signal that teaches people to distrust the tool.
+ */
+function renderVerification(report: { passed: boolean; score: number }, runTests: boolean): string {
+  const verdict = report.passed ? style.green('passed') : style.red('failed');
+  const scope = runTests ? 'form and project tests' : 'form only — no tests were run';
+  return `${verdict} (score ${report.score.toFixed(2)}) — checked ${scope}`;
+}
 
 function renderStatus(status: string): string {
   switch (status) {
