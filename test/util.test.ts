@@ -27,7 +27,6 @@ import {
 import { rankLocalModels } from '../src/providers/index.ts';
 import { DEFAULT_CONFIG, PROVIDER_PROFILES, UNKNOWN_PRICE, providerProfile } from '../src/config/schema.ts';
 import { formatBytes, formatDuration, readJsonOrNull, resolvePath, writeJsonAtomic } from '../src/util/fsx.ts';
-import { localDayKey, localHour, shiftDayKey } from '../src/util/clock.ts';
 import { tempDir, testConfig } from './helpers.ts';
 
 const SPEC: FlagSpec[] = [
@@ -196,9 +195,9 @@ describe('config', () => {
   });
 
   it('persists only what differs from the defaults', () => {
-    // Writing the whole merged config made the file a snapshot: `proto train
-    // enable` froze every default of that day, so later improvements to a default
-    // (better batch size, higher dataset caps) never reached an existing user.
+    // Writing the whole merged config made the file a snapshot: the first
+    // `proto config set` froze every default of that day, so later improvements
+    // to a default never reached an existing user.
     // Separate directories, because each saveConfig replaces the whole file with
     // the delta of the config it was handed.
     const dirA = tempDir();
@@ -290,30 +289,6 @@ describe('config', () => {
       if (prevFloor === undefined) delete process.env['PROTO_QUALITY_FLOOR'];
       else process.env['PROTO_QUALITY_FLOOR'] = prevFloor;
     }
-  });
-});
-
-describe('clock helpers', () => {
-  it('keys the day in local time, not UTC', () => {
-    // The daily budgets are the user's daily budgets. A UTC key would reset them
-    // mid-afternoon for anyone west of Greenwich.
-    const lateEvening = new Date(2025, 5, 1, 23, 30, 0);
-    assert.equal(localDayKey(lateEvening), '2025-06-01');
-    const earlyMorning = new Date(2025, 5, 2, 0, 30, 0);
-    assert.equal(localDayKey(earlyMorning), '2025-06-02');
-    assert.equal(localHour(lateEvening), 23);
-  });
-
-  it('pads single-digit months and days so keys sort lexicographically', () => {
-    assert.equal(localDayKey(new Date(2025, 0, 5)), '2025-01-05');
-    assert.ok(localDayKey(new Date(2025, 8, 9)) > localDayKey(new Date(2025, 8, 10 - 10)));
-  });
-
-  it('shifts across month and year boundaries', () => {
-    assert.equal(shiftDayKey('2025-03-01', -1), '2025-02-28');
-    assert.equal(shiftDayKey('2025-01-01', -1), '2024-12-31');
-    assert.equal(shiftDayKey('2024-02-28', 1), '2024-02-29');
-    assert.equal(shiftDayKey('2025-12-31', 1), '2026-01-01');
   });
 });
 

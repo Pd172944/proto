@@ -2,10 +2,9 @@
  * Router entry point: assemble the environment, then apply the policy.
  *
  * Kept separate from `policy.ts` so that the policy stays a pure function of
- * (features, environment, config) — which is what makes offline counterfactual
- * replay possible: a logged episode stores the features and the environment it
- * saw, so `proto replay` can re-run `decideRoute` against historical decisions
- * without touching a model or a network.
+ * (features, environment, config). Everything that touches the world — probing
+ * the local runtime, checking for an API key, reading config — happens here, so
+ * the decision itself can be unit-tested without a model or a network.
  */
 
 import { join } from 'node:path';
@@ -34,7 +33,7 @@ export interface RouteOptions {
   cloudSpendTodayUsd?: number;
   /** Whether verification will run on the candidate. */
   verifierAvailable?: boolean;
-  /** Override the local decode-speed estimate (e.g. measured from episodes). */
+  /** Override the local decode-speed estimate (e.g. a measured value). */
   localTokensPerSec?: number;
 }
 

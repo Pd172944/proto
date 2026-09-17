@@ -62,7 +62,7 @@ function coerceEdit(raw: unknown): CandidateEdit | null {
  *
  * Models drift from the requested envelope, so we accept several shapes and
  * record *which* shape was used. A high drift rate is itself a useful signal
- * about the local model's reliability and shows up in `proto episodes stats`.
+ * about the local model's reliability.
  */
 export function parseCandidate(text: string, opts: { expectedPaths?: string[] } = {}): {
   candidate: CandidateOutput | null;

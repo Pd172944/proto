@@ -2,8 +2,8 @@
  * Time-sortable, collision-resistant identifiers.
  *
  * We use a ULID-shaped scheme (48-bit timestamp + 80 bits of randomness,
- * Crockford base32) so that episode ids sort lexicographically by creation
- * time. This matters because the RL pipeline streams JSONL shards in id order
+ * Crockford base32) so that ids sort lexicographically by creation time. This
+ * matters because session files are written and read back in id order
  * and we want deterministic, cheap ordering without reading timestamps.
  */
 
@@ -60,7 +60,7 @@ export function shortId(prefix = ''): string {
   return `${prefix}${prefix ? '-' : ''}${t}${r}`;
 }
 
-/** Stable content-addressed id; used for dedup of contributions/datasets. */
+/** Stable content-addressed id, for dedup (for example of edit candidates). */
 export function contentId(content: string): string {
   return createHash('sha256').update(content, 'utf8').digest('hex').slice(0, 32);
 }

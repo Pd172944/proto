@@ -48,9 +48,9 @@ export interface CandidateOutput {
   answer?: string;
   explanation?: string;
   risk?: 'low' | 'medium' | 'high';
-  /** Anything the model flagged as uncertain; feeds the reward function. */
+  /** Anything the model itself flagged as uncertain, when it said so. */
   uncertainty?: string;
-  /** Raw text before parsing, retained for the episode log. */
+  /** Raw text before parsing, kept so a failure can be explained. */
   raw?: string;
 }
 
@@ -66,7 +66,7 @@ export interface AppliedFile {
 export interface VerificationReport {
   /** True when nothing with severity `error` was found. */
   passed: boolean;
-  /** 0..1 quality score used by the reward function. */
+  /** 0..1 quality score. Reported to the user; nothing else consumes it. */
   score: number;
   checks: CheckResult[];
   /** Human-readable reasons the candidate failed. */

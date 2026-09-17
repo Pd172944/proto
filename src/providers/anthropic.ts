@@ -8,8 +8,8 @@
  *     the cloud cost of escalation noticeably.
  *  2. Extended thinking budgets, so "high effort" is a real, configurable knob
  *     rather than a prompt-level suggestion.
- *  3. `stop_reason` / `usage` are reported precisely, which keeps the episode
- *     cost accounting comparable to other providers.
+ *  3. `stop_reason` / `usage` are reported precisely, which keeps the cost
+ *     accounting comparable across providers.
  */
 
 import { computeCost, emptyResponse, ProviderError } from './types.ts';

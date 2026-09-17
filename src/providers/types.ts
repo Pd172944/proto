@@ -11,7 +11,7 @@
  *    `ProviderError` only for transport/auth problems the caller should treat
  *    as "this tier is unusable right now".
  *  - `costUsd` is always computed from normalized `Usage` + the local price
- *    table, so an episode's recorded cost is comparable across providers.
+ *    table, so reported cost is comparable across providers.
  */
 
 import type { Price } from '../config/schema.ts';

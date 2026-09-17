@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Two-regime coding harness: a very fast local model for easy tasks and a cloud model for hard ones, with deferred local RL from logged episodes.",
+  "description": "Two-regime coding harness: a very fast local model for easy tasks and a cloud model for hard ones, with verification and automatic escalation.",
   "license": "MIT",
   "engines": {
     "node": ">=22.6.0"

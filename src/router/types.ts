@@ -1,7 +1,7 @@
 /**
- * Router types. These are the shared vocabulary between feature extraction,
- * scoring, policy, the episode log and the training datasets, so they change
- * and is a pure function of the task, so it can be validated offline.
+ * Router types: the shared vocabulary between feature extraction, scoring and
+ * the policy. Routing is a pure function of the task and the environment, which
+ * is what lets `proto route` explain any decision without calling a model.
  */
 
 export type Tier = 'local-tiny' | 'local' | 'cloud-cheap' | 'cloud-strong';
@@ -113,11 +113,9 @@ export interface ExpectedCost {
 /**
  * The environment the decision was made in.
  *
- * Stored on every decision (and therefore every episode) because it is what
- * makes offline counterfactual replay sound: re-running the policy under a
- * *different* config is only meaningful if we know which tiers were even
- * eligible at the time. Without this, `proto replay` would happily "discover"
- * that it should have used a cloud model that had no API key.
+ * Carried on every decision because the reason a tier was rejected is usually
+ * about the environment, not the task: `proto route --explain` can only say
+ * "local was unavailable" if the decision remembers that it was.
  */
 export interface RouterEnvironmentSnapshot {
   localEnabled: boolean;

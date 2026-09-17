@@ -2,15 +2,15 @@
  * The heuristic scorer: a transparent, zero-data estimate of whether the local
  * model will succeed on this task, plus an overall difficulty score.
  *
- * Why keep a heuristic at all when there is a learned scorer? Three reasons:
- *  1. **Cold start.** A brand-new install has no episodes; the learned model has
- *     nothing to learn from. The heuristic is the prior the learned scorer is
- *     blended toward, so behaviour degrades gracefully instead of randomly.
+ * Why rules rather than anything learned? Three reasons:
+ *  1. **There is nothing to learn from.** This harness keeps no corpus of past
+ *     tasks, so there is no data to fit and no cold-start problem to work
+ *     around. A rule set is the whole model.
  *  2. **Auditability.** Users will not trust a router they cannot read. Every
- *     number here can be printed with `proto route --explain`.
- *  3. **Safety net.** If training produces a pathological weight vector, the
- *     heuristic bounds how badly the router can misbehave (see `policy.ts`
- *     vetoes, which are model-independent).
+ *     number here can be printed with `proto route --explain`, and every
+ *     coefficient is a stated opinion rather than an opaque weight.
+ *  3. **Predictability.** The same task always routes the same way. A router
+ *     that changes its mind is very hard to debug and impossible to test.
  *
  * The coefficients are opinions, not measurements. They are deliberately
  * conservative: a false "easy" verdict costs a wasted local attempt plus an
@@ -23,7 +23,7 @@ import type { TaskClass, TaskFeatures } from './types.ts';
 export interface HeuristicScore {
   /** Estimated probability the local model produces a verifiable-correct answer. */
   pLocalSuccess: number;
-  /** 0 = trivial, 1 = very hard. Used for vetoes and exploration bounds. */
+  /** 0 = trivial, 1 = very hard. Drives cloud tier choice and the vetoes. */
   difficulty: number;
   /** Contributions, largest magnitude first; used for `--explain`. */
   contributions: Array<{ feature: string; value: number; note: string }>;
@@ -82,7 +82,7 @@ export function heuristicScore(f: TaskFeatures): HeuristicScore {
       feature: 'constraints',
       // Constraint load moves *difficulty* as well as the success logit below.
       // This matters because difficulty — not p — drives tier selection between
-      // cloud-cheap and cloud-strong, the exploration bounds, and the harness's
+      // cloud-cheap and cloud-strong, and the harness's
       // escalation threshold. An earlier revision moved only the logit, so a task
       // pushed off local by four interacting constraints still reported
       // difficulty 0.17 and was labelled "easy-to-moderate but cloud-routed",

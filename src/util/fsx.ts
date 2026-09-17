@@ -3,7 +3,7 @@
  *
  * All harness state is written through these helpers so that:
  *  - writes are atomic (temp file + rename), so a crash mid-write cannot
- *    corrupt the episode log — important because the RL data is append-only and
+ *    corrupt a file another process is reading — these are read back whole and
  *    the user may never notice silent corruption.
  *  - JSONL appends are single `appendFile` calls (atomic enough for
  *    single-writer use, which is what we guarantee via a lockfile).

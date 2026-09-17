@@ -192,7 +192,7 @@ export interface LocalConfig {
   /**
    * `ollama`        — recommended default; one-line install, model marketplace.
    * `llamacpp`      — llama.cpp `llama-server` (OpenAI-compatible).
-   * `mlx`           — `mlx_lm.server`; required runtime once a LoRA adapter is active.
+   * `mlx`           — `mlx_lm.server`; the fastest path on Apple Silicon for many models.
    * `openai`        — any other OpenAI-compatible local server (LM Studio, vLLM).
    */
   runtime: 'ollama' | 'llamacpp' | 'mlx' | 'openai';
@@ -208,10 +208,6 @@ export interface LocalConfig {
   contextWindow: number;
   maxOutputTokens: number;
   temperature: number;
-  /** Path to an exported LoRA adapter directory, if training has produced one. */
-  adapterPath?: string;
-  /** Ask the runtime to expose logprobs (enables offline scoring/GRPO later). */
-  requestLogprobs: boolean;
 }
 
 export interface CloudConfig {
@@ -260,7 +256,6 @@ export interface CloudConfig {
 
 export interface RoutingConfig {
   /** `heuristic` = rules only; `learned` = model only; `hybrid` = learned blended with rules. */
-  mode: 'heuristic' | 'learned' | 'hybrid';
   /** Minimum probability the local model succeeds before we let it try. */
   qualityFloor: number;
   /** Minimum probability for *mutating* tasks with no automatic verifier. */
@@ -272,20 +267,6 @@ export interface RoutingConfig {
    * than for a bad patch that silently lands in the codebase.
    */
   qualityFloorReadOnly: number;
-  /**
-   * Exploration: with probability `epsilon`, route a task the policy would
-   * have sent to the cloud to the local model anyway — but ONLY when a
-   * verifier can catch failure. Without this the router never observes the
-   * counterfactuals it needs to learn from.
-   */
-  exploration: {
-    enabled: boolean;
-    epsilon: number;
-    /** Never explore on tasks above this difficulty score. */
-    maxDifficultyForExploration: number;
-    /** Never explore when the local estimate exceeds this many tokens. */
-    maxTokensForExploration: number;
-  };
   /** How many times the local model may repair its own output before escalating. */
   maxLocalRepairAttempts: number;
   /** Hard cap on cloud calls per task, to bound worst-case spend. */
@@ -341,8 +322,6 @@ export const DEFAULT_CONFIG: ProtoConfig = {
     contextWindow: 8192,
     maxOutputTokens: 1536,
     temperature: 0.1,
-    adapterPath: undefined,
-    requestLogprobs: false,
   },
   cloud: {
     enabled: false,
@@ -356,16 +335,9 @@ export const DEFAULT_CONFIG: ProtoConfig = {
     promptCaching: true,
   },
   routing: {
-    mode: 'hybrid',
     qualityFloor: 0.72,
     qualityFloorUnverified: 0.9,
     qualityFloorReadOnly: 0.55,
-    exploration: {
-      enabled: true,
-      epsilon: 0.06,
-      maxDifficultyForExploration: 0.45,
-      maxTokensForExploration: 4000,
-    },
     maxLocalRepairAttempts: 1,
     maxCloudAttempts: 2,
     cloudBudgetUsdPerDay: 5,

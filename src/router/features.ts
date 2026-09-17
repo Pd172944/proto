@@ -7,9 +7,9 @@
  *
  *  - Routing costs ~0 ms and $0. Asking a model "is this easy?" would defeat the
  *    entire point of having a cheap tier.
- *  - The same features are what the learned scorer consumes. Because they are
- *    deterministic, a logged episode can be replayed offline to evaluate a new
- *    routing policy without re-running any model (see `proto replay`).
+ *  - They are deterministic and pure, so the same task always produces the same
+ *    decision. That is what makes routing testable, and what lets
+ *    `proto route --explain` account for a decision after the fact.
  *
  * The heuristics are intentionally transparent and unit-tested. Where a signal
  * is uncertain we prefer to under-claim: an over-confident "this is easy" sends

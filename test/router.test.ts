@@ -1,6 +1,5 @@
 /**
- * Router tests: feature extraction, classification, the policy decision, and the
- * learned scorer.
+ * Router tests: feature extraction, classification and the policy decision.
  *
  * These are the tests that protect the project's central claim. If classification
  * silently degrades, easy work stops flowing to the local model; if the policy

@@ -8,13 +8,11 @@
  *     verifier can validate without guessing. Prose is not verifiable.
  *  2. **The system preamble must be byte-stable** so that providers with prompt
  *     caching (Anthropic, OpenAI) actually hit the cache on repeat calls. That
- *     is why nothing episode-specific is allowed into the system message — no
+ *     is why nothing run-specific is allowed into the system message — no
  *     timestamps, no task text, no file names.
  *
- * `PROMPT_VERSION` is stored on every attempt. When the prompt changes, old
- * SFT data was generated under different instructions and should not be mixed
- * blindly with new data; the version makes that decision possible instead of
- * silent.
+ * `PROMPT_VERSION` is stored on every attempt, so a reported result can always
+ * be traced back to the instructions that produced it.
  */
 
 import type { TaskContext, TaskFeatures } from '../router/types.ts';

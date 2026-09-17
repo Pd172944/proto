@@ -4,7 +4,7 @@
  * This module is the load-bearing part of "route easy work to a cheap local
  * model". A router without a verifier is just a way to be wrong more cheaply.
  * The verifier is what lets the harness *know* a local attempt failed and
- * escalate, and it is also the primary reward signal for the RL pipeline — so
+ * escalate, and it decides whether an answer is shown as verified — so
  * its scoring must be stable, explainable and independent of which model
  * produced the candidate.
  *
@@ -213,7 +213,7 @@ function finalize(
   let score = 1 - 0.4 * errors.length - 0.08 * warnings.length;
   score = Math.max(0, Math.min(1, score));
   const passed = errors.length === 0;
-  // A failing candidate must never look "almost good" to the reward function.
+  // A failing candidate must never look "almost good" to a caller reading the score.
   if (!passed) score = Math.min(score, 0.3);
   return {
     passed,

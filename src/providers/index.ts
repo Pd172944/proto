@@ -107,7 +107,7 @@ export function buildLocalProvider(cfg: ProtoConfig): Provider {
   }
 
   // Everything else is OpenAI-compatible. `mlx` in particular is served by
-  // `mlx_lm.server`, which is how a trained LoRA adapter gets used.
+  // `mlx_lm.server`, which speaks the same API.
   return new OpenAICompatibleProvider({
     id: 'local',
     label: cfg.local.runtime === 'mlx' ? 'MLX (local)' : cfg.local.runtime === 'llamacpp' ? 'llama.cpp (local)' : 'Local OpenAI-compatible',

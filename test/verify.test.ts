@@ -231,7 +231,7 @@ describe('verifyCandidate end to end', () => {
     });
     assert.equal(report.passed, false);
     assert.ok(report.blockers.some((b) => /syntax/i.test(b)), report.blockers.join(' | '));
-    assert.ok(report.score <= 0.3, 'a failed candidate must not look almost-good to the reward function');
+    assert.ok(report.score <= 0.3, 'a failed candidate must not look almost-good to a caller reading the score');
   });
 
   it('fails a candidate that changes nothing', async () => {
