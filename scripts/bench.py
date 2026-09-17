@@ -229,8 +229,8 @@ def materialize(task: Task, run_dir: Path, run_root: Path) -> tuple[Path, Path]:
             shutil.rmtree(p)
     shutil.copytree(task.workspace, ws)
     home.mkdir(parents=True)
-    # A private config keeps episodes and sessions from bleeding across tasks, and
-    # pins the model so a stale global config cannot change what is being measured.
+    # A private config keeps sessions from bleeding across tasks, and pins the model
+    # so a stale global config cannot change what is being measured.
     if task.setup is not None:
         # Git-based tasks cannot ship a `.git` directory: a nested repository inside
         # the harness repo is a gitlink, not a directory of files. Building the state

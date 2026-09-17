@@ -378,7 +378,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         if target.exists():
             shutil.rmtree(target)
         target.mkdir(parents=True, exist_ok=True)
-        # A per-problem PROTO_HOME keeps each run's episodes and session isolated, so
+        # A per-problem PROTO_HOME keeps each run's session isolated, so
         # a HumanEval run never pollutes the real var/ directory.
         proto_home = target / ".proto"
         (target / "solution.py").write_text(p["prompt"] + "    pass\n")

@@ -82,7 +82,7 @@ const TIER_FLAG_VALUES: Tier[] = ['local-tiny', 'local', 'cloud-cheap', 'cloud-s
 
 const doctor: Command = {
   name: 'doctor',
-  summary: 'check runtimes, providers, verifier and trainer; say exactly what is missing',
+  summary: 'check runtimes, providers and the verifier; say exactly what is missing',
   usage: 'proto doctor [--probe-cloud]',
   flags: [
     { name: 'probe-cloud', type: 'boolean', description: 'make a real (tiny) cloud request to validate the API key' },
@@ -464,7 +464,7 @@ const route: Command = {
 
 const run: Command = {
   name: 'run',
-  summary: 'run a task end to end: route, attempt, verify, escalate, record',
+  summary: 'run a task end to end: route, attempt, verify, escalate',
   usage: 'proto run "<task>" [--file path]... [--apply] [--tier tier] [--dry-run]',
   flags: [
     { name: 'task', type: 'string', description: 'task text (alternative to a positional)' },
@@ -587,7 +587,7 @@ function renderStatus(status: string): string {
 
 const models: Command = {
   name: 'models',
-  summary: 'list local models and adapters; adopt one with `use`; print download commands',
+  summary: 'list local models; adopt one with `use`; print download commands',
   usage: 'proto models [list|use <name>|pull <name>] [--yes]',
   flags: [
     { name: 'yes', type: 'boolean', description: 'confirm running a download command' },

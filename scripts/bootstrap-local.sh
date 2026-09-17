@@ -94,7 +94,7 @@ case "$RUNTIME" in
 
   mlx)
     step "2. create a virtualenv and install MLX-LM"
-    say "  MLX is both the fastest inference path on Apple Silicon and the trainer."
+    say "  MLX is usually the fastest inference path on Apple Silicon."
     run "python3 -m venv \"$DATA_DIR/venv\""
     run "\"$DATA_DIR/venv/bin/pip\" install --upgrade pip"
     run "\"$DATA_DIR/venv/bin/pip\" install mlx-lm"

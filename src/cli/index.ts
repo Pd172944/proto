@@ -141,8 +141,8 @@ function printTopLevelHelp(commands: Command[], showBanner: boolean): void {
   if (showBanner) {
     out(style.bold('proto') + ' — two-regime coding harness (fast local model + cloud model)');
     out('');
-    out('Routes each task to the tier that can handle it, verifies the result, escalates on failure,');
-    out('and learns from what happened — locally, cheaply, and only with your consent.');
+    out('Routes each task to the tier that can handle it, verifies the result, and escalates to the');
+    out('cloud when the local model cannot finish the job.');
     out('');
   }
   out(style.bold('usage:') + ' proto <command> [options]');
